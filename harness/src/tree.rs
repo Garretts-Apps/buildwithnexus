@@ -234,6 +234,92 @@ fn walk_snapshot(cwd: &Path) -> Snapshot {
     Snapshot::Files(files)
 }
 
+/// The dependencies the project's manifests under `cwd` name, as
+/// `manifest:name` (roadmap 3.2): `package.json`, `Cargo.toml`,
+/// `requirements.txt` and `go.mod`.
+pub fn manifest_dependencies(cwd: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(v) = std::fs::read_to_string(cwd.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
+        for sec in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ] {
+            for k in v[sec].as_object().into_iter().flat_map(|m| m.keys()) {
+                out.insert(format!("npm:{k}"));
+            }
+        }
+    }
+    if let Ok(t) = std::fs::read_to_string(cwd.join("Cargo.toml")) {
+        let mut in_deps = false;
+        for line in t.lines().map(str::trim) {
+            if line.starts_with('[') {
+                let h = line.trim_matches(|c| c == '[' || c == ']');
+                in_deps = h.ends_with("dependencies");
+                // `[dependencies.serde]` names one by itself.
+                if let Some((_, name)) = h.split_once("dependencies.") {
+                    out.insert(format!("cargo:{}", name.trim()));
+                    in_deps = false;
+                }
+                continue;
+            }
+            if in_deps {
+                if let Some((name, _)) = line.split_once('=') {
+                    let name = name.trim().trim_matches('"');
+                    if !name.is_empty() && !name.starts_with('#') {
+                        out.insert(format!("cargo:{name}"));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(t) = std::fs::read_to_string(cwd.join("requirements.txt")) {
+        for line in t.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
+                continue;
+            }
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                .collect();
+            if !name.is_empty() {
+                out.insert(format!("pypi:{}", name.to_ascii_lowercase()));
+            }
+        }
+    }
+    if let Ok(t) = std::fs::read_to_string(cwd.join("go.mod")) {
+        let mut block = false;
+        for line in t.lines().map(str::trim) {
+            let entry = if block {
+                if line == ")" {
+                    block = false;
+                    continue;
+                }
+                line
+            } else if line == "require (" {
+                block = true;
+                continue;
+            } else if let Some(r) = line.strip_prefix("require ") {
+                r
+            } else {
+                continue;
+            };
+            if let Some(m) = entry
+                .split_whitespace()
+                .next()
+                .filter(|m| !m.starts_with("//"))
+            {
+                out.insert(format!("go:{m}"));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +369,49 @@ mod tests {
         let s2 = take(&d);
         std::fs::remove_file(d.join("b.txt")).unwrap();
         assert!(!take(&d).same_as(&s2));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn manifests_name_their_dependencies() {
+        let d = std::env::temp_dir().join(format!("bwn-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"dependencies":{"a":"1"},"devDependencies":{"b":"2"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n[dependencies]\nserde = \"1\"\n[dev-dependencies]\ntempfile = \"3\"\n[dependencies.ring]\nversion = \"0.17\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("requirements.txt"),
+            "# c\nRequests>=2\n-r other.txt\nflask\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("go.mod"),
+            "module m\nrequire (\n  github.com/x/y v1\n)\nrequire golang.org/z v2\n",
+        )
+        .unwrap();
+        let got: Vec<String> = manifest_dependencies(&d).into_iter().collect();
+        assert_eq!(
+            got,
+            [
+                "cargo:ring",
+                "cargo:serde",
+                "cargo:tempfile",
+                "go:github.com/x/y",
+                "go:golang.org/z",
+                "npm:a",
+                "npm:b",
+                "pypi:flask",
+                "pypi:requests"
+            ]
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

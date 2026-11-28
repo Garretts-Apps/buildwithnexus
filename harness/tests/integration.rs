@@ -12089,3 +12089,510 @@ fn invariant_ve3_checks_a_rule_refuses_do_not_end_in_success() {
         "{result}"
     );
 }
+
+// ── VE-4: facts come from checks, not tool names (roadmap 3.2) ─────────────
+
+fn verify_rule_ids(r: &Run) -> Vec<String> {
+    r.events
+        .iter()
+        .filter(|e| e["type"] == "verify")
+        .flat_map(|e| {
+            e["report"]["rule_violations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|v| v["rule_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn auth_and_dependency_change(extra: Vec<String>) -> Vec<String> {
+    let with_dep = r#"{"name":"p","version":"1.0.0","scripts":{"test":"node -e \"process.exit(require('fs').readFileSync('state.txt','utf8').includes('good')?0:1)\""},"dependencies":{"left-pad":"1.3.0"}}"#;
+    let mut v = vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "src/auth/login.js", "content": "x"}),
+        ),
+        tool_call("c2", "read_file", json!({"path": "package.json"})),
+        tool_call(
+            "c3",
+            "write_file",
+            json!({"path": "package.json", "content": with_dep}),
+        ),
+    ];
+    v.extend(extra);
+    for _ in 0..4 {
+        v.push(finish("done"));
+    }
+    v
+}
+
+// A change to an auth path and a new dependency, then a web search: the
+// security review and the dependency reviews stay unmet.
+#[test]
+fn invariant_ve4_a_web_search_meets_no_review() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(auth_and_dependency_change(vec![tool_call(
+        "c4",
+        "web_search",
+        json!({"query": "left-pad license vulnerabilities maintenance"}),
+    )]));
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "add login with left-pad");
+    let ids = verify_rule_ids(&r);
+    assert!(ids.iter().any(|i| i == "new_dependency_review"), "{ids:?}");
+    assert!(
+        ids.iter()
+            .any(|i| i == "auth_change_requires_security_review"),
+        "{ids:?}"
+    );
+    assert!(!r.success);
+}
+
+// A `security` check the person named, passing on the final tree, is what
+// meets the security review.
+#[test]
+fn invariant_ve4_a_named_security_check_meets_the_security_review() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(auth_and_dependency_change(vec![]));
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(
+        &home,
+        "checks",
+        json!([{"name": "sec", "command": "node -e \"\"", "kind": "security"}]),
+    );
+    let r = run(&home, &cwd, "add login with left-pad");
+    let ids = verify_rule_ids(&r);
+    assert!(
+        !ids.iter()
+            .any(|i| i == "auth_change_requires_security_review"),
+        "{ids:?}"
+    );
+    assert!(ids.iter().any(|i| i == "new_dependency_review"), "{ids:?}");
+}
+
+// AU-5 (roadmap 3.3; analysis A2, A4): from sandboxed commands the model
+// plants a pre-commit hook and `core.fsmonitor` (through git and around
+// it), then commits its work with `git add` and `git commit`. The commit
+// goes through bwn; `.git/config` and the hooks are byte-identical after;
+// and when bwn and then the user run git, the planted code never runs.
+// Landlock alone and no backend can't keep `.git` read-only and don't
+// claim this (the capability table says so).
+#[test]
+fn invariant_au5_planted_git_hooks_and_config_never_run() {
+    if matches!(
+        std::env::var("BWN_TEST_SANDBOX_BACKEND").as_deref(),
+        Ok("landlock" | "none")
+    ) || cfg!(windows)
+    {
+        eprintln!("skip: this backend can't keep .git read-only");
+        return;
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap()
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join("a.txt"), "a").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    let snapshot = || {
+        let mut v = vec![std::fs::read(cwd.join(".git/config")).unwrap()];
+        let mut hooks: Vec<_> = std::fs::read_dir(cwd.join(".git/hooks"))
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        hooks.sort();
+        for h in hooks {
+            v.push(h.display().to_string().into_bytes());
+            v.push(std::fs::read(&h).unwrap_or_default());
+        }
+        v
+    };
+    let before = snapshot();
+    let attempts = [
+        "printf '#!/bin/sh\\ntouch HOOK_RAN\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+        "git config core.fsmonitor 'touch FSMONITOR_RAN'",
+        "/usr/bin/git config core.fsmonitor 'touch FSMONITOR_RAN'",
+        "git -c core.hooksPath=. commit --allow-empty -m via-c",
+    ];
+    let mut script: Vec<String> = attempts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| tool_call(&format!("p{i}"), "run_command", json!({"command": c})))
+        .collect();
+    script.push(tool_call(
+        "w",
+        "write_file",
+        json!({"path": "new.txt", "content": "x"}),
+    ));
+    script.push(tool_call(
+        "c",
+        "run_command",
+        json!({"command": "git add new.txt && git commit -m from-the-sandbox && git log --oneline -1"}),
+    ));
+    script.push(finish("done"));
+    let port = serve(script);
+    write_sandboxed_config(&home, "auto", port);
+    let env = cell_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "--accept-posture", "commit"],
+        &env,
+    );
+    assert!(
+        snapshot() == before,
+        ".git/config or hooks changed; stderr: {}",
+        r.stderr
+    );
+    // The commit went through bwn.
+    let log = String::from_utf8_lossy(&g(&["log", "--oneline"]).stdout).into_owned();
+    assert!(
+        log.contains("from-the-sandbox"),
+        "log: {log}\nresults: {}",
+        r.text_of("tool_result")
+    );
+    assert!(!log.contains("via-c"), "{log}");
+    // The user runs git next: nothing planted runs.
+    g(&["status"]);
+    g(&["commit", "--allow-empty", "-q", "-m", "by-the-user"]);
+    for m in ["HOOK_RAN", "FSMONITOR_RAN"] {
+        assert!(!cwd.join(m).exists(), "{m}");
+    }
+}
+
+// VE-3 and roadmap 3.8 (analysis V3): with auto_commit on, a change whose
+// checks fail is not committed; the same change, fixed, is committed once,
+// at the end of the turn.
+#[test]
+fn invariant_ve3_no_commit_is_made_for_a_failing_change() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.name", "t"],
+        &["config", "user.email", "t@t"],
+        &["add", "."],
+        &["commit", "-q", "-m", "base"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let commits = || {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["log", "--oneline"])
+                .current_dir(&cwd)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .count()
+    };
+    let config = |port: u16| {
+        std::fs::write(
+            home.join("config.json"),
+            json!({
+                "provider": "ollama", "model": "test-model", "permission": "auto",
+                "base_url": format!("http://127.0.0.1:{port}/v1"),
+                "sandbox": "off", "auto_commit": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let port = serve(break_state());
+    config(port);
+    let r = run(&home, &cwd, "break it");
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+    assert_eq!(commits(), 1, "a failing change was committed");
+    assert!(
+        r.text_of("notice").contains("not committed"),
+        "{}",
+        r.text_of("notice")
+    );
+
+    let port = serve(vec![
+        tool_call("f0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "f1",
+            "write_file",
+            json!({"path": "state.txt", "content": "good\n"}),
+        ),
+        tool_call(
+            "f2",
+            "write_file",
+            json!({"path": "notes.txt", "content": "n"}),
+        ),
+        finish("fixed"),
+    ]);
+    config(port);
+    let r = run(&home, &cwd, "fix it");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(commits(), 2, "one commit for the passing change");
+}
+
+// ── 3.4: the assurance tool contract, with stub scanners ───────────────────
+
+const STUB_SCANNER: &str = r#"
+const fs = require('fs');
+const [mode, out] = process.argv.slice(2);
+const sarif = (results) => JSON.stringify({ version: '2.1.0', runs: [{ tool: { driver: { name: 'stub', rules: [{ id: 'R2', defaultConfiguration: { level: 'note' } }] } }, results }] });
+const finding = (level) => ({ ruleId: 'R1', level, message: { text: 'planted' }, locations: [{ physicalLocation: { artifactLocation: { uri: 'a.js' }, region: { startLine: 3 } } }] });
+const print = (s) => out ? fs.writeFileSync(out, s) : process.stdout.write(s);
+switch (mode) {
+  case 'clean': print(sarif([])); process.exit(1); // the report, not the exit status, decides
+  case 'error': print(sarif([finding('error')])); process.exit(0);
+  case 'note': print(sarif([{ ruleId: 'R2', message: { text: 'by the rule default' } }])); break;
+  case 'garbage': print('Segmentation fault'); break;
+  case 'json': print(JSON.stringify([{ RuleID: 'aws-key', File: 'a.js' }])); break;
+  case 'json-empty': print('[]'); break;
+}
+"#;
+
+#[test]
+fn reports_decide_checks_that_name_a_format() {
+    if !npm_available() {
+        eprintln!("skipping: node not installed");
+        return;
+    }
+    let case = |spec: Value, pass: bool| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(home.join("stub.js"), STUB_SCANNER).unwrap();
+        let port = serve(vec![
+            tool_call("c1", "write_file", json!({"path": "a.js", "content": "x"})),
+            finish("done"),
+            finish("done"),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "auto", port);
+        let mut spec = spec;
+        let cmd = spec["command"].as_str().unwrap().replace(
+            "STUB",
+            &format!("node '{}'", home.join("stub.js").display()),
+        );
+        spec["command"] = json!(cmd);
+        add_user_setting(&home, "checks", json!([spec.clone()]));
+        let r = run(&home, &cwd, "edit");
+        assert_eq!(r.success, pass, "{spec}: {}", r.text_of("tool_result"));
+        if !pass {
+            assert_eq!(r.code, Some(7), "{spec}");
+        }
+        r.text_of("tool_result")
+    };
+    let sarif = |mode: &str, fail_on: Option<&str>| {
+        let mut s = json!({"name": "scan", "command": format!("STUB {mode}"), "format": "sarif"});
+        if let Some(f) = fail_on {
+            s["fail_on"] = json!(f);
+        }
+        s
+    };
+    case(sarif("clean", None), true);
+    let out = case(sarif("error", None), false);
+    assert!(out.contains("R1 at a.js:3"), "{out}");
+    case(sarif("note", None), true);
+    case(sarif("note", Some("note")), false);
+    let out = case(sarif("garbage", None), false);
+    assert!(out.contains("isn't JSON"), "{out}");
+    // JSON findings, from a report file.
+    let json_case = |mode: &str| json!({"name": "secrets", "command": format!("STUB {mode} report.json"), "format": "json", "output": "report.json"});
+    case(json_case("json"), false);
+    case(json_case("json-empty"), true);
+}
+
+// AC-2 (roadmap 3.7; analysis C4): the commit bwn makes for a passing
+// change names an evidence record; `evidence verify` accepts it, and
+// refuses it once the record is edited, the commit is amended with other
+// content, or for a commit that names no record.
+#[test]
+fn invariant_ac2_a_commit_verifies_against_its_evidence_record() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join("base.txt"), "b").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "new.txt", "content": "from the agent\n"}),
+        ),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "off", "auto_commit": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "add a file");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let verify = |rev: &str| {
+        Command::new(BIN)
+            .args(["evidence", "verify", rev])
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .output()
+            .unwrap()
+    };
+    let ok = verify("HEAD");
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stdout)
+    );
+    let msg = g(&["log", "-1", "--format=%B"]);
+    let hash = msg
+        .lines()
+        .find_map(|l| l.strip_prefix("Bwn-Evidence: "))
+        .expect("trailer")
+        .trim()
+        .to_string();
+    // A record edited afterwards.
+    let rec = home.join("evidence").join(format!("{hash}.json"));
+    let original = std::fs::read_to_string(&rec).unwrap();
+    std::fs::write(&rec, original.replace("from", "FROM")).unwrap();
+    std::fs::write(&rec, original.replace("\"passed\":null", "\"passed\":true")).unwrap();
+    assert_eq!(verify("HEAD").status.code(), Some(1));
+    std::fs::write(&rec, &original).unwrap();
+    assert!(verify("HEAD").status.success());
+    // The commit amended with other content, trailer kept.
+    std::fs::write(cwd.join("new.txt"), "something else\n").unwrap();
+    g(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+    let out = verify("HEAD");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A commit that names no record.
+    assert_eq!(verify("HEAD~1").status.code(), Some(1));
+}
+
+// 3.5 (SD-1, first slice): with `security_gates`, a seeded secret and a
+// seeded vulnerable dependency each block completion; a missing scanner
+// blocks too; the dependency scanner runs only when a manifest changed.
+#[cfg(unix)]
+#[test]
+fn invariant_sd1_secret_and_dependency_gates_block_and_a_missing_scanner_blocks() {
+    use std::os::unix::fs::PermissionsExt;
+    // Built at run time so no secret-shaped text sits in the source.
+    let marker = format!("{}{}", "AK", "IA");
+    let seeded = format!("key = {marker}{}\n", "QQQQRRRRSSSSTTTT");
+    let stubs = tmp("stubs");
+    let stub = |name: &str, body: &str| {
+        let p = stubs.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    stub(
+        "gitleaks",
+        &format!(
+            r#"out=""; while [ $# -gt 0 ]; do [ "$1" = "--report-path" ] && out="$2"; shift; done
+if grep -rqs {marker} . ; then echo '[{{"RuleID":"aws-access-token","File":"x"}}]' > "$out"; else echo '[]' > "$out"; fi"#
+        ),
+    );
+    stub(
+        "osv-scanner",
+        r#"touch OSV_RAN
+if grep -qs vulnerable-pkg package.json; then echo '{"results":[{"packages":[{"package":{"name":"vulnerable-pkg"}}]}]}'; else echo '{"results":[]}'; fi"#,
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_gated = |script: Vec<String>, gates: Value, with_stubs: bool, setup: &dyn Fn(&Path)| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        setup(&cwd);
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "security_gates", gates);
+        let env = [(
+            "PATH",
+            if with_stubs {
+                path.as_str()
+            } else {
+                "/usr/bin:/bin"
+            },
+        )];
+        let r = run_env(&home, &cwd, &["--json", "run", "edit"], &env);
+        (r, cwd)
+    };
+    let edit = |path: &str, content: &str| {
+        let mut v = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": path, "content": content}),
+        )];
+        v.extend((0..3).map(|_| finish("done")));
+        v
+    };
+    let none = |_: &Path| {};
+    let (r, _) = run_gated(edit("cfg.txt", &seeded), json!(["secrets"]), true, &none);
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("aws-access-token"));
+    let (r, _) = run_gated(
+        edit("cfg.txt", "key = from-the-vault\n"),
+        json!(["secrets"]),
+        true,
+        &none,
+    );
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    let pkg = |c: &Path| std::fs::write(c.join("package.json"), r#"{"name":"p"}"#).unwrap();
+    let script = vec![
+        tool_call("r", "read_file", json!({"path": "package.json"})),
+        tool_call(
+            "w",
+            "write_file",
+            json!({"path": "package.json", "content": r#"{"name":"p","dependencies":{"vulnerable-pkg":"1.0.0"}}"#}),
+        ),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ];
+    let (r, _) = run_gated(script, json!(["dependencies"]), true, &pkg);
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    let (r, cwd) = run_gated(edit("notes.txt", "n"), json!(["dependencies"]), true, &pkg);
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(!cwd.join("OSV_RAN").exists());
+    let (r, _) = run_gated(edit("cfg.txt", "x"), json!(["secrets"]), false, &none);
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+}

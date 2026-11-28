@@ -4373,6 +4373,93 @@ struct WorkCheck {
     label: String,
     kind: &'static str,
     cmd: String,
+    /// Read from a report, not the exit status (roadmap 3.4).
+    report: Option<Report>,
+}
+
+/// How a check's report is read: SARIF 2.1.0 or JSON findings, the lowest
+/// SARIF level that fails, and the file it is written to (else stdout).
+#[derive(Clone, Debug, PartialEq)]
+struct Report {
+    sarif: bool,
+    fail_on: u8,
+    output: Option<PathBuf>,
+}
+
+// SARIF levels, low to high; an unknown one counts as a warning.
+fn sarif_rank(level: &str) -> u8 {
+    match level {
+        "none" => 0,
+        "note" => 1,
+        "error" => 3,
+        _ => 2,
+    }
+}
+
+/// The findings a report holds at or above its threshold, each as one line,
+/// or why it can't be read (which fails the check: a scanner that crashed
+/// or printed something else hasn't shown the change is clean).
+fn report_findings(report: &Report, text: &str) -> Result<Vec<String>, String> {
+    let v: Value =
+        serde_json::from_str(text.trim()).map_err(|e| format!("the report isn't JSON ({e})"))?;
+    if report.sarif {
+        if v["version"].as_str() != Some("2.1.0") {
+            return Err("the report isn't SARIF 2.1.0".into());
+        }
+        let runs = v["runs"].as_array().ok_or("the SARIF report has no runs")?;
+        let mut out = Vec::new();
+        for run in runs {
+            let rules = run["tool"]["driver"]["rules"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for r in run["results"].as_array().into_iter().flatten() {
+                let rule_id = r["ruleId"].as_str().unwrap_or("");
+                let default_level = rules
+                    .iter()
+                    .find(|d| d["id"].as_str() == Some(rule_id))
+                    .and_then(|d| d["defaultConfiguration"]["level"].as_str());
+                let level = r["level"].as_str().or(default_level).unwrap_or("warning");
+                if sarif_rank(level) < report.fail_on {
+                    continue;
+                }
+                let loc = &r["locations"][0]["physicalLocation"];
+                let at = match (
+                    loc["artifactLocation"]["uri"].as_str(),
+                    loc["region"]["startLine"].as_u64(),
+                ) {
+                    (Some(u), Some(l)) => format!(" at {u}:{l}"),
+                    (Some(u), None) => format!(" at {u}"),
+                    _ => String::new(),
+                };
+                let msg = r["message"]["text"].as_str().unwrap_or("");
+                out.push(format!(
+                    "{level} {rule_id}{at}: {}",
+                    msg.chars().take(160).collect::<String>()
+                ));
+            }
+        }
+        return Ok(out);
+    }
+    let list = match &v {
+        Value::Array(a) => a.clone(),
+        Value::Object(m) => [
+            "findings",
+            "results",
+            "vulnerabilities",
+            "Results",
+            "issues",
+        ]
+        .iter()
+        .find_map(|k| m.get(*k).and_then(Value::as_array).cloned())
+        .ok_or("the JSON report has no findings array")?,
+        Value::Null => Vec::new(),
+        _ => return Err("the JSON report isn't a list of findings".into()),
+    };
+    Ok(list
+        .iter()
+        .map(|f| f.to_string().chars().take(160).collect())
+        .collect())
 }
 
 /// The checks a turn's changes must pass, pinned when the turn starts
@@ -4383,6 +4470,9 @@ struct WorkCheck {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckPlan {
     checks: Vec<WorkCheck>,
+    /// Scanners from `security_gates`, and whether each runs only when a
+    /// manifest changed (roadmap 3.5).
+    gates: Vec<(WorkCheck, bool)>,
     configured: bool,
     scripts: Vec<(String, Option<String>)>,
 }
@@ -4391,29 +4481,117 @@ impl CheckPlan {
     pub fn is_empty(&self) -> bool {
         self.checks.is_empty()
     }
+
+    /// Whether the plan holds a `security` check a person named: only the
+    /// `checks` setting has them, never detection.
+    /// Whether `security_gates` adds scanners, which only the harness's
+    /// own round runs.
+    pub fn has_gates(&self) -> bool {
+        !self.gates.is_empty()
+    }
+
+    pub fn has_security_check(&self) -> bool {
+        self.configured && self.checks.iter().any(|c| c.kind == "security")
+    }
 }
 
 /// The checks for `cwd` now.
+// The scanners `security_gates` names, as checks read from their reports.
+fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
+    let report_file = |name: &str| {
+        std::env::temp_dir().join(format!("bwn-gate-{name}-{}.json", std::process::id()))
+    };
+    let mut out = Vec::new();
+    for g in gates {
+        match g.as_str() {
+            "secrets" => {
+                let r = report_file("secrets");
+                out.push((
+                    WorkCheck {
+                        label: "secrets (gitleaks)".into(),
+                        kind: "security",
+                        cmd: format!(
+                            "gitleaks detect --no-git --no-banner --source . --report-format json --report-path '{}' --exit-code 0",
+                            r.display()
+                        ),
+                        report: Some(Report { sarif: false, fail_on: 1, output: Some(r) }),
+                    },
+                    false,
+                ));
+            }
+            "dependencies" => out.push((
+                WorkCheck {
+                    label: "dependencies (osv-scanner)".into(),
+                    kind: "security",
+                    cmd: "osv-scanner scan source --format json -r .".into(),
+                    report: Some(Report {
+                        sarif: false,
+                        fail_on: 1,
+                        output: None,
+                    }),
+                },
+                true,
+            )),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Files whose change means the dependencies may have changed.
+pub const MANIFESTS: &[&str] = &[
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "requirements.txt",
+    "pyproject.toml",
+    "poetry.lock",
+    "uv.lock",
+    "go.mod",
+    "go.sum",
+    "Gemfile",
+    "Gemfile.lock",
+    "composer.json",
+    "composer.lock",
+];
+
 pub fn check_plan(cwd: &Path) -> CheckPlan {
     // Read live: the loader leaves out an untrusted project's `checks`, and
     // a project trusted mid-session applies from its next check.
-    let configured = crate::config::load_settings_from_dir(cwd).and_then(|s| s.checks);
-    match configured {
+    let settings = crate::config::load_settings_from_dir(cwd);
+    let gates = gate_checks(
+        settings
+            .as_ref()
+            .map(|s| s.security_gates.as_slice())
+            .unwrap_or(&[]),
+    );
+    let configured = settings.and_then(|s| s.checks);
+    let mut plan = match configured {
         Some(list) => CheckPlan {
             checks: list
                 .iter()
-                .map(|c| c.parts())
-                .filter(|(_, _, cmd)| !cmd.trim().is_empty())
-                .map(|(label, kind, cmd)| WorkCheck {
+                .map(|c| (c.parts(), c.report()))
+                .filter(|((_, _, cmd), _)| !cmd.trim().is_empty())
+                .map(|((label, kind, cmd), report)| WorkCheck {
+                    report: report.map(|(f, fail_on, output)| Report {
+                        sarif: f != "json",
+                        fail_on: sarif_rank(&fail_on).max(1),
+                        output: output.map(|o| cwd.join(o)),
+                    }),
                     label,
                     kind: match kind.as_str() {
                         "build" => "build",
                         "lint" => "lint",
+                        "security" => "security",
                         _ => "test",
                     },
                     cmd,
                 })
                 .collect(),
+            gates: Vec::new(),
             configured: true,
             scripts: Vec::new(),
         },
@@ -4430,17 +4608,20 @@ pub fn check_plan(cwd: &Path) -> CheckPlan {
             };
             CheckPlan {
                 checks,
+                gates: Vec::new(),
                 configured: false,
                 scripts,
             }
         }
-    }
+    };
+    plan.gates = gates;
+    plan
 }
 
 /// Run the plan pinned at the start of the turn. A detected plan whose
 /// scripts the turn rewrote fails: the checks would no longer be the ones
 /// the turn started with.
-pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path) -> Outcome {
+pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, manifests_changed: bool) -> Outcome {
     if !pinned.configured {
         let now = check_plan(cwd);
         let changed: Vec<&str> = pinned
@@ -4467,10 +4648,19 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path) -> Outcome {
             };
         }
     }
-    if pinned.configured && pinned.checks.is_empty() {
+    let gates: Vec<WorkCheck> = pinned
+        .gates
+        .iter()
+        .filter(|(_, deps_only)| !deps_only || manifests_changed)
+        .map(|(c, _)| c.clone())
+        .collect();
+    if pinned.configured && pinned.checks.is_empty() && gates.is_empty() {
         return ok("check_work: no checks configured (the `checks` setting is empty).");
     }
-    run_checks(&pinned.checks, cwd, pinned.configured)
+    // The gates are checks read from a report: one that can't run leaves
+    // no report and fails.
+    let all: Vec<WorkCheck> = pinned.checks.iter().cloned().chain(gates).collect();
+    run_checks(&all, cwd, pinned.configured)
 }
 
 fn package_json_script_bodies(cwd: &Path) -> std::collections::BTreeMap<String, String> {
@@ -4533,16 +4723,19 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("cargo build"),
                 kind: "build",
                 cmd: owned("cargo build --quiet"),
+                report: None,
             },
             WorkCheck {
                 label: owned("cargo test"),
                 kind: "test",
                 cmd: owned("cargo test --quiet"),
+                report: None,
             },
             WorkCheck {
                 label: owned("cargo clippy"),
                 kind: "lint",
                 cmd: owned("cargo clippy --quiet -- -D warnings"),
+                report: None,
             },
         ];
     }
@@ -4562,6 +4755,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("typecheck"),
                 kind: "build",
                 cmd: format!("{pm} run typecheck"),
+                report: None,
             });
         }
         if has_script("build") {
@@ -4569,6 +4763,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("build"),
                 kind: "build",
                 cmd: format!("{pm} run build"),
+                report: None,
             });
         }
         if has_script("test") {
@@ -4576,6 +4771,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("test"),
                 kind: "test",
                 cmd: format!("{pm} test"),
+                report: None,
             });
         }
         if has_script("lint") {
@@ -4583,6 +4779,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("lint"),
                 kind: "lint",
                 cmd: format!("{pm} run lint"),
+                report: None,
             });
         }
         return checks;
@@ -4593,16 +4790,19 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("go build"),
                 kind: "build",
                 cmd: owned("go build ./..."),
+                report: None,
             },
             WorkCheck {
                 label: owned("go test"),
                 kind: "test",
                 cmd: owned("go test ./..."),
+                report: None,
             },
             WorkCheck {
                 label: owned("go vet"),
                 kind: "lint",
                 cmd: owned("go vet ./..."),
+                report: None,
             },
         ];
     }
@@ -4617,11 +4817,13 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 label: owned("pytest"),
                 kind: "test",
                 cmd: owned("python -m pytest -q"),
+                report: None,
             },
             WorkCheck {
                 label: owned("ruff"),
                 kind: "lint",
                 cmd: owned("ruff check ."),
+                report: None,
             },
         ];
     }
@@ -4650,6 +4852,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
             label: cmd.to_string(),
             kind: "custom",
             cmd: cmd.to_string(),
+            report: None,
         };
         return run_checks(&[one], cwd, false);
     }
@@ -4678,6 +4881,10 @@ fn run_checks(checks: &[WorkCheck], cwd: &Path, required: bool) -> Outcome {
     let mut any_fail = false;
     let mut ran = 0usize;
     for c in checks {
+        // A report file left from before isn't this run's.
+        if let Some(out) = c.report.as_ref().and_then(|r| r.output.as_ref()) {
+            let _ = std::fs::remove_file(out);
+        }
         let cap = match shell_command(&c.cmd, cwd)
             .and_then(|command| run_with_timeout(command, None, CHECK_TIMEOUT))
         {
@@ -4697,6 +4904,50 @@ fn run_checks(checks: &[WorkCheck], cwd: &Path, required: bool) -> Outcome {
                 CHECK_TIMEOUT.as_secs(),
                 c.cmd
             ));
+        } else if let Some(report) = &c.report {
+            // Read from its report, not its exit status (roadmap 3.4).
+            ran += 1;
+            let text = match &report.output {
+                Some(p) => std::fs::read_to_string(p)
+                    .map_err(|e| format!("no report at {}: {e}", p.display())),
+                None => Ok(cap.stdout.clone()),
+            };
+            match text.and_then(|t| report_findings(report, &t)) {
+                Ok(f) if f.is_empty() => {
+                    sections.push(format!("✓ {} passed: no findings (`{}`)", c.label, c.cmd));
+                }
+                Ok(f) => {
+                    any_fail = true;
+                    let shown: Vec<&String> = f.iter().take(20).collect();
+                    sections.push(format!(
+                        "✗ {} FAILED: {} finding{} (`{}`)\n{}{}",
+                        c.label,
+                        f.len(),
+                        if f.len() == 1 { "" } else { "s" },
+                        c.cmd,
+                        shown
+                            .iter()
+                            .map(|l| format!("  {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        if f.len() > 20 {
+                            format!("\n  … and {} more", f.len() - 20)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                Err(why) => {
+                    any_fail = true;
+                    let tail = truncate_head_tail(combined.trim().to_string(), 800);
+                    sections.push(format!(
+                        "✗ {} FAILED: {why} (exit {}, `{}`)\n{tail}",
+                        c.label,
+                        cap.code.unwrap_or(-1),
+                        c.cmd
+                    ));
+                }
+            }
         } else if !required && check_tool_missing(&combined, cap.code) {
             sections.push(format!(
                 "– {} — skipped (checker not installed: `{}`)",
@@ -5310,9 +5561,8 @@ fn maybe_auto_commit(name: &str, input: &Value, cwd: &Path) {
     if paths.is_empty() {
         return;
     }
-    if let Err(e) = crate::commands::auto_commit(cwd, &paths, spec.canonical) {
-        crate::report::notice(&format!("auto-commit skipped: {e}"));
-    }
+    // Committed at the end of the turn, once the change passed its checks.
+    crate::commands::hold_for_commit(cwd, &paths, spec.canonical);
 }
 
 fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
@@ -6097,6 +6347,7 @@ fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 tests_added: vec![],
                 dependencies_changed: vec![],
                 tests_passed: None,
+                security_checks_passed: false,
             };
             let report = verifier.verify(&ctx);
             ok(crate::verifier::Verifier::format_report(&report))

@@ -448,8 +448,8 @@ an earlier prompt and restores the code, the conversation, or both; the prompt
 comes back in the input box to edit and send again. `/diff` lists every changed and new file
 with one summary line and shows a chosen file's diff; `/diff turn` shows what
 the last turn changed. `/commit` drafts a message and commits only when you
-answer `c` (`[c]ommit · [e]dit · [n]o`). File-tool edits are also committed
-on their own (`bwn:` subject, no git hooks) when the folder is a git
+answer `c` (`[c]ommit · [e]dit · [n]o`). A turn's file-tool edits are committed
+once its checks pass (`bwn:` subject, no hooks) when the folder is a git
 repository. `"auto_commit": false` or `--no-auto-commit` turns that off.
 Shell commands are not committed. Each folder keeps its newest 500
 checkpoints. [RECOVERY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/RECOVERY.md) has the details.

@@ -381,6 +381,30 @@ fn serve(client: TcpStream, cwd: &Path, private: bool) -> std::io::Result<()> {
     let text = String::from_utf8_lossy(&head).into_owned();
     let mut first = text.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+    // git through bwn (roadmap 3.3): answered here, never dialled.
+    if method.eq_ignore_ascii_case("POST")
+        && target.trim_end_matches('/') == format!("http://{}", crate::gitbroker::BROKER_HOST)
+    {
+        let len = text
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+            .min(1 << 20);
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body)?;
+        let reply = crate::gitbroker::answer(&body);
+        let mut client = client;
+        return write!(
+            client,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+    }
     let rules = Rules::load(cwd);
     let (host, port, connect) = if method.eq_ignore_ascii_case("CONNECT") {
         let (h, p) = split_host_port(target, 443);

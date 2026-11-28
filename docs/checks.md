@@ -14,9 +14,25 @@ name them yourself, set `checks`:
 { "checks": ["npm test", { "name": "types", "command": "npx tsc --noEmit", "kind": "build" }] }
 ```
 
-`kind` (`build`, `test` or `lint`, default `test`) is what `check_work`'s
-`only` filters on. `"checks": []` means no checks, and a named check that
+`kind` (`build`, `test`, `lint` or `security`, default `test`) is what
+`check_work`'s `only` filters on. A passing `security` check (a SAST or
+secret scanner you run) is what meets the verifier's security review for an
+auth change; a web search doesn't. `"checks": []` means no checks, and a named check that
 can't run fails. The checks are the ones the turn started with: a turn that
 rewrites the `package.json` script they run fails them. A project's `checks` run
 code, so like its hooks they wait until you trust the file; until then bwn
 runs the checks it detects.
+
+A check can be read from a scanner's report instead of its exit status:
+`"format": "sarif"` (SARIF 2.1.0) or `"json"` (a list of findings), with
+`"fail_on"` the lowest SARIF level that fails (`error` by default) and
+`"output"` a report file the command writes. It passes only when the report
+parses and holds no finding; a scanner that crashed fails.
+
+```json
+{ "checks": [{ "name": "sast", "command": "semgrep scan --sarif --quiet", "format": "sarif", "kind": "security" }] }
+```
+
+`"security_gates": ["secrets", "dependencies"]` adds two scanners every
+change must pass: gitleaks on every change, and osv-scanner when a manifest
+or lockfile changed. A gate whose scanner isn't installed blocks.

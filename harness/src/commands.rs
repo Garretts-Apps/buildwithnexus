@@ -636,20 +636,17 @@ pub fn auto_commit_enabled() -> bool {
     AUTO_COMMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Stage `paths` and commit them when auto-commit is on and `cwd` is a git
-/// work tree. Hooks and fsmonitor are not run. An empty diff is not an error.
-/// Unit tests skip this so a `write_file` test cannot commit the repo; the
-/// binary (integration tests included) does not.
-pub fn auto_commit(
-    cwd: &std::path::Path,
-    paths: &[std::path::PathBuf],
-    tool: &str,
-) -> Result<Option<String>, String> {
-    if cfg!(test) || !auto_commit_enabled() || paths.is_empty() {
-        return Ok(None);
-    }
-    if git_work_tree(cwd).is_none() {
-        return Ok(None);
+// File-tool edits waiting for the turn's verification (roadmap 3.8): the
+// work tree they belong to, the paths, and the tool that made them.
+type Held = (std::path::PathBuf, Vec<String>, String);
+static HELD: std::sync::Mutex<Vec<Held>> = std::sync::Mutex::new(Vec::new());
+
+/// Hold `paths` for the commit at the end of the turn, when auto-commit is
+/// on and `cwd` is a git work tree. Nothing is committed per edit: a change
+/// is committed once it passed the project's checks (roadmap 3.8; V3).
+pub fn hold_for_commit(cwd: &std::path::Path, paths: &[std::path::PathBuf], tool: &str) {
+    if !auto_commit_enabled() || paths.is_empty() || git_work_tree(cwd).is_none() {
+        return;
     }
     let rels: Vec<String> = paths
         .iter()
@@ -661,10 +658,56 @@ pub fn auto_commit(
         })
         .filter(|p| !p.is_empty() && p != "." && !p.starts_with("../"))
         .collect();
-    if rels.is_empty() {
-        return Ok(None);
+    if !rels.is_empty() {
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push((
+            cwd.to_path_buf(),
+            rels,
+            tool.to_string(),
+        ));
     }
-    commit_paths(cwd, &rels, tool)
+}
+
+/// How many files are waiting to be committed.
+pub fn held_count() -> usize {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all: Vec<&String> = held.iter().flat_map(|(_, r, _)| r).collect();
+    all.sort();
+    all.dedup();
+    all.len()
+}
+
+/// Commit what was held, one commit per work tree, and forget it. Called
+/// when the turn's change passed (or there was nothing to check).
+pub fn commit_held() -> Vec<Result<Option<String>, String>> {
+    let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by_tree: Vec<(std::path::PathBuf, Vec<String>, Vec<String>)> = Vec::new();
+    for (cwd, rels, tool) in held {
+        match by_tree.iter_mut().find(|(c, _, _)| *c == cwd) {
+            Some((_, r, t)) => {
+                r.extend(rels);
+                t.push(tool);
+            }
+            None => by_tree.push((cwd, rels, vec![tool])),
+        }
+    }
+    by_tree
+        .into_iter()
+        .map(|(cwd, mut rels, mut tools)| {
+            rels.sort();
+            rels.dedup();
+            tools.sort();
+            tools.dedup();
+            let tool = if tools.len() == 1 {
+                tools.remove(0)
+            } else {
+                "edit".into()
+            };
+            if cfg!(test) {
+                return Ok(None);
+            }
+            commit_paths(&cwd, &rels, &tool)
+        })
+        .collect()
 }
 
 /// Stage and commit, ignoring the auto-commit switch. Tests call this.
@@ -682,7 +725,36 @@ pub(crate) fn commit_paths(
         return Ok(None);
     }
     let subject = commit_subject(tool, rels);
-    git_commit_no_hooks(cwd, &hooks, &with_audit_trailer(&format!("{subject}\n"))).map(Some)
+    let mut msg = with_audit_trailer(&format!("{subject}\n"));
+    // The evidence record of what the turn established (roadmap 3.7): each
+    // file as staged, the checks and the verifier's verdict.
+    let staged = git(&["ls-files", "-s", "--"]
+        .iter()
+        .copied()
+        .chain(rels.iter().map(String::as_str))
+        .collect::<Vec<_>>())
+    .unwrap_or_default();
+    let files: Vec<(String, String)> = rels
+        .iter()
+        .map(|r| {
+            let blob = staged
+                .lines()
+                .find(|l| l.split_once('\t').is_some_and(|(_, p)| p == r))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("-")
+                .to_string();
+            (r.clone(), blob)
+        })
+        .collect();
+    if let Some(hash) = crate::evidence::record(&files) {
+        let sep = if msg.contains("\n\n") { "" } else { "\n" };
+        msg = format!(
+            "{}{sep}\n{}: {hash}\n",
+            msg.trim_end(),
+            crate::evidence::TRAILER
+        );
+    }
+    git_commit_no_hooks(cwd, &hooks, &msg).map(Some)
 }
 
 fn git_work_tree(cwd: &std::path::Path) -> Option<std::path::PathBuf> {

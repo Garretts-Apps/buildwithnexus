@@ -371,6 +371,7 @@ pub(super) fn handle_verify_audit(perm: Permission, cwd: &std::path::Path) -> bo
         tests_added: vec![],
         dependencies_changed: vec![],
         tests_passed,
+        security_checks_passed: false,
     };
 
     let report = verifier.verify(&ctx);
