@@ -451,9 +451,11 @@ session.
   distribution's bubblewrap fails its loopback setup there. bwn runs on
   Landlock alone, with no network until the user allows it (field cell
   `noble`).
-- **Bubblewrap.** Started after `setns` into the session's namespaces,
-  bubblewrap works with `--unshare-all --share-net`; this was checked by hand
-  as an unprivileged user. Wiring that in is the next step.
+- **Bubblewrap.** It is started after `setns` into the session's
+  namespaces, with `--unshare-all --share-net`, so it shares that network.
+  Inside it, `bwn __confine-net private:<port>` applies only seccomp's
+  TCP-only rule. Where the namespace can't be made, bubblewrap keeps the
+  host network held by port.
 
 Tests: `invariant_netns_*` in `harness/src/userns.rs` and
 `tests/integration.rs`.

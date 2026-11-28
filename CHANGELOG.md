@@ -7,8 +7,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
-- **On bwn's namespace backend, commands get a private network.** Every
-  command now joins one network namespace made for the session. It holds
+- **Commands get a private network, on bubblewrap and on bwn's namespace
+  backend.** Every command now joins one network namespace made for the
+  session. It holds
   only loopback and the host checker, so a command can't reach the internet,
   the local network or this machine's own services except through the
   checker.
@@ -28,8 +29,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A server `start_server` runs there is not on this machine's own
     loopback, so a browser here can't open it. Its result says so; use
     `screenshot_url` to see the page.
-  - Bubblewrap still holds commands by port; running it in the same
-    namespace is next.
+  - Bubblewrap starts inside that namespace. Where bwn can't make one (a
+    setuid bubblewrap with unprivileged namespaces off), bubblewrap keeps
+    the host network held by port, as before.
 - **On Landlock alone, commands get no network unless you allow it.**
   Where neither bubblewrap nor unprivileged user namespaces work, Landlock
   holds a command to the host checker by port, not address, so it could
