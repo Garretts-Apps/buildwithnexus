@@ -1519,26 +1519,23 @@ fn hook_allow_cannot_bypass_readonly_gate() {
 }
 
 #[test]
-fn auto_check_work_only_when_files_changed_at_top_level_once() {
-    // Baseline: depth 0, a file changed, model skipped check_work, first time.
-    assert!(should_auto_check_work(Permission::Auto, 0, 1, false, 0));
-    assert!(should_auto_check_work(Permission::Ask, 0, 3, false, 0));
-    // Subagents never trigger it (the parent will).
-    assert!(!should_auto_check_work(Permission::Auto, 1, 1, false, 0));
-    // Nothing written: nothing to check.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 0, false, 0));
-    // The model already checked its work.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 1, true, 0));
-    // Read-only turns can't have changed files, and never run checks.
+fn auto_check_work_runs_for_an_uncovered_change_at_top_level() {
+    // A change no pass of the project's checks covers, at depth 0.
+    assert!(should_auto_check_work(Permission::Auto, 0, true, 0));
+    assert!(should_auto_check_work(Permission::Ask, 0, true, 1));
+    // Subagents never trigger it (the parent checks the whole tree).
+    assert!(!should_auto_check_work(Permission::Auto, 1, true, 0));
+    // Nothing changed, or a pass covers the tree as it is.
+    assert!(!should_auto_check_work(Permission::Auto, 0, false, 0));
+    // Read-only turns never run checks.
+    assert!(!should_auto_check_work(Permission::ReadOnly, 0, true, 0));
+    // Bounded: after MAX_AUTO_CHECK_ROUNDS a failing run ends as a failure.
     assert!(!should_auto_check_work(
-        Permission::ReadOnly,
+        Permission::Auto,
         0,
-        1,
-        false,
-        0
+        true,
+        MAX_AUTO_CHECK_ROUNDS
     ));
-    // At most one automatic round per turn.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 1, false, 1));
 }
 
 #[test]

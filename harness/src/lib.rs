@@ -78,6 +78,7 @@ pub mod sixel;
 mod system_prompt;
 pub mod tools;
 pub mod trace;
+pub mod tree;
 pub mod tui;
 pub mod update;
 pub mod usage;

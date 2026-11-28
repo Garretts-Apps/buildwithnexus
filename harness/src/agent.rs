@@ -2299,6 +2299,14 @@ struct TurnState {
     check_work_called: bool,
     check_work_passed: Option<bool>,
     auto_check_rounds: usize,
+    /// The working tree when the turn began, and when the project's
+    /// mandatory checks last passed (roadmap 3.1). A change is whatever
+    /// differs, whichever tool made it.
+    tree_base: Option<crate::tree::Snapshot>,
+    mandatory_pass: Option<crate::tree::Snapshot>,
+    // The project's checks were refused for want of a terminal: asking
+    // again at finish would only be refused again.
+    checks_unapprovable: bool,
     /// The first call of the last tool round that never ran (unknown tool,
     /// invalid or missing arguments): ending on text after one is not success.
     last_unrun: Option<String>,
@@ -2391,6 +2399,9 @@ fn build_turn(
     }
 
     let mut st = TurnState::default();
+    if depth == 0 {
+        st.tree_base = Some(crate::tree::take(cwd));
+    }
     // From here the loop only appends to the transcript, except where it
     // compacts, which resets the count.
     let mut tokens = TokenCount::default();
@@ -2687,6 +2698,7 @@ fn build_turn(
                 // automatic round would only be refused again.
                 let reason = if checks_unapproved {
                     st.check_work_called = true;
+                    st.checks_unapprovable = true;
                     report::notice(&format!("  {CHECKS_NOT_RUN}"));
                     format!(
                         "{reason} — the project's {CHECKS_NOT_RUN}. Do not retry them; \
@@ -2873,18 +2885,37 @@ fn build_turn(
             // The model finished after editing files without checking its
             // work: run check_work once on its behalf and, if the project's
             // checks fail, hand the report back for one more round.
-            if should_auto_check_work(
-                perm,
-                depth,
-                st.changed_files.len(),
-                st.check_work_called,
-                st.auto_check_rounds,
-            ) {
+            // A change is what the working tree shows, not which tools ran:
+            // `sed` through run_command and a helper's edits count. The
+            // project's checks must have passed on the tree as it is now; a
+            // check_work with the model's own `command` is advisory and
+            // never satisfies them (roadmap 3.1; VE-1, VE-2, VE-5).
+            let now = (depth == 0).then(|| crate::tree::take(cwd));
+            let changed = !st.changed_files.is_empty()
+                || match (&st.tree_base, &now) {
+                    (Some(base), Some(now)) => !now.same_as(base),
+                    _ => false,
+                };
+            let covered = match (&st.mandatory_pass, &now) {
+                (Some(pass), Some(now)) => now.same_as(pass),
+                _ => false,
+            };
+            if let (Some(base), Some(now)) = (&st.tree_base, &now) {
+                let top = crate::config::find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+                for k in now.changed_since(base) {
+                    let rel = k.split_once(':').map_or(k.as_str(), |(_, r)| r);
+                    let path = top.join(rel).display().to_string();
+                    if !st.changed_files.contains(&path) {
+                        st.changed_files.push(path);
+                    }
+                }
+            }
+            if !st.checks_unapprovable
+                && should_auto_check_work(perm, depth, changed && !covered, st.auto_check_rounds)
+            {
                 st.auto_check_rounds += 1;
                 let input = serde_json::json!({});
-                report::notice(
-                    "  ⟳ finish called without check_work — running the project's checks",
-                );
+                report::notice("  ⟳ running the project's checks on this turn's changes");
                 report::tool_call("check_work", &tools::preview("check_work", &input), &input);
                 trace_tool_call("check_work", &input, "build", depth);
                 // The project's scripts run like any model call: hook, then gate.
@@ -2893,6 +2924,7 @@ fn build_turn(
                 let mut out = match gate_checks(perm, &input, cwd) {
                     Some((reason, no_terminal)) => {
                         report::tool_denied(&reason);
+                        st.checks_unapprovable |= no_terminal;
                         report::notice(&if no_terminal {
                             format!("  {CHECKS_NOT_RUN}")
                         } else {
@@ -2921,11 +2953,15 @@ fn build_turn(
                 });
                 if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
                     st.check_work_passed = Some(!out.is_error);
+                    if !out.is_error {
+                        // The tree as the checks left it.
+                        st.mandatory_pass = Some(crate::tree::take(cwd));
+                    }
                     if out.is_error {
                         msgs.push(Msg::User(format!(
-                            "[harness] You called finish without running check_work, so it ran \
-                             automatically and the project's checks FAILED:\n{}\nFix the failures, \
-                             run check_work again, then call finish.",
+                            "[harness] The project's checks ran on your changes and FAILED:\n{}\n\
+                             Fix the failures, then call finish. A check_work with your own \
+                             `command` does not replace these checks.",
                             out.content
                         )));
                         continue;
@@ -3065,19 +3101,23 @@ fn build_turn(
 // Whether a finish call should trigger an automatic check_work: top-level
 // turns only, only when a file was actually written or edited, only when the
 // model skipped check_work itself, never in read-only mode, and once per turn.
+// The project's checks run at finish when the tree changed this turn and no
+// pass of them covers it as it is now (roadmap 3.1), at most
+// MAX_AUTO_CHECK_ROUNDS times a turn; after that, failing checks end the
+// run as a failure.
 fn should_auto_check_work(
     perm: Permission,
     depth: usize,
-    files_changed: usize,
-    check_work_called: bool,
+    uncovered_change: bool,
     auto_rounds: usize,
 ) -> bool {
     depth == 0
-        && files_changed > 0
-        && !check_work_called
+        && uncovered_change
         && !matches!(perm, Permission::ReadOnly)
-        && auto_rounds == 0
+        && auto_rounds < MAX_AUTO_CHECK_ROUNDS
 }
+
+const MAX_AUTO_CHECK_ROUNDS: usize = 2;
 
 // check_work had nothing to run (no recognised project, or every checker is
 // missing) — nothing to enforce, and no verdict to record.
@@ -3273,8 +3313,15 @@ fn record_outcome(
     trace_tool_result(name, &out.content, out.is_error, "build", ctx.depth);
     if name == "check_work" {
         st.check_work_called = true;
-        if !check_work_found_no_project(&out.content) {
+        // The model's own `command`, or a subset (`only`), is advisory: it
+        // doesn't stand for the project's checks (roadmap 3.1, VE-1).
+        let advisory = input["command"]
+            .as_str()
+            .is_some_and(|c| !c.trim().is_empty())
+            || input["only"].as_str().is_some_and(|o| !o.trim().is_empty());
+        if !advisory && !check_work_found_no_project(&out.content) {
             st.check_work_passed = Some(!out.is_error);
+            st.mandatory_pass = (!out.is_error).then(|| crate::tree::take(ctx.cwd));
         }
     }
     // Feed the verifier real data: every executed call, and the files
