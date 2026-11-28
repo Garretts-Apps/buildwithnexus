@@ -553,7 +553,59 @@ fn biggest_attachment(text: &str) -> Option<(String, usize)> {
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
     let mut noop = |_: &str| {};
-    request(p, msgs, tools, false, &mut sink, &mut noop)
+    with_fallback(p, |p| request(p, msgs, tools, false, &mut sink, &mut noop))
+}
+
+// The `fallback_model` setting (roadmap 4.6): a model on the same endpoint
+// to try once when the session's is rate-limited or overloaded past its
+// retries. Same endpoint and key, so nothing the startup check showed moves.
+static FALLBACK_MODEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set the session's fallback model (None: no fallback).
+pub fn set_fallback_model(model: Option<String>) {
+    *FALLBACK_MODEL.lock().unwrap_or_else(|e| e.into_inner()) =
+        model.filter(|m| !m.trim().is_empty());
+}
+
+// Whether an error is the server being busy or limiting, after retries.
+fn busy_error(e: &str) -> bool {
+    [
+        "HTTP 429", "HTTP 529", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+    ]
+    .iter()
+    .any(|c| e.contains(c))
+}
+
+fn with_fallback(
+    p: &Provider,
+    mut call: impl FnMut(&Provider) -> Result<Reply, String>,
+) -> Result<Reply, String> {
+    match call(p) {
+        Err(e) if busy_error(&e) => {
+            let fallback = FALLBACK_MODEL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            // Under a spending cap, a model with no known price can't be
+            // held to it (as at startup): no fallback to one.
+            let capped_unpriced = |f: &String| {
+                crate::usage::budget().is_some()
+                    && crate::usage::price_for(f).is_none()
+                    && !is_local_url(&p.base_url)
+            };
+            match fallback.filter(|f| *f != p.model && !capped_unpriced(f)) {
+                Some(f) => {
+                    crate::report::notice(&format!(
+                        "  {} unavailable (the server is busy or limiting it); trying {f}",
+                        p.model
+                    ));
+                    call(&p.with_model(&f))
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
 }
 
 fn is_local_url(url: &str) -> bool {
@@ -641,7 +693,7 @@ pub fn stream(
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
-    request(p, msgs, tools, true, on_text, on_thinking)
+    with_fallback(p, |p| request(p, msgs, tools, true, on_text, on_thinking))
 }
 
 // A restrictive chat template (notably Gemma's on llama.cpp) rejected the

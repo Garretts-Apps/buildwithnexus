@@ -249,6 +249,16 @@ pub fn init(cwd: &Path, interactive: bool) {
             );
         }
     }
+    // Enabled plugins' hooks, as the user's own (roadmap 4.6).
+    for (path, text) in config::plugin_hook_files(cwd) {
+        let mut found = Vec::new();
+        parse_checked(&text, Source::Home, &mut list, &mut found);
+        issues.extend(
+            found
+                .into_iter()
+                .map(|i| format!("{i} ({})", path.display())),
+        );
+    }
     // Trust is asked for once by `trust_project`; here it is only checked.
     for name in config::PROJECT_SETTINGS_FILES {
         let Ok(text) = std::fs::read_to_string(cwd.join(".buildwithnexus").join(name)) else {
