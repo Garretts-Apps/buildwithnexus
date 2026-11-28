@@ -369,6 +369,21 @@ impl CheckSpec {
     }
 }
 
+/// One architectural boundary (roadmap 5.7): files matching `from` may not
+/// contain any `forbid` text (an import path, a module name). `why` names
+/// the decision it records.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Boundary {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub from: Vec<String>,
+    #[serde(default)]
+    pub forbid: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Preset id; empty means setup has not run (a hooks-only project file).
@@ -528,6 +543,10 @@ pub struct Settings {
     /// installed blocks too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_gates: Vec<String>,
+    /// Architectural boundaries checked on every mandatory round (roadmap
+    /// 5.7): a changed file under `from` may not contain any of `forbid`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<Boundary>,
     /// When the transcript is compacted and what stays verbatim (roadmap
     /// 4.5): `threshold_percent` of the model's context (default 80) and
     /// `keep_recent` messages.
@@ -679,6 +698,7 @@ impl Default for Settings {
             shell_env_passthrough: Vec::new(),
             checks: None,
             security_gates: Vec::new(),
+            boundaries: Vec::new(),
             compaction: None,
             fallback_model: None,
             lsp: BTreeMap::new(),
@@ -3026,6 +3046,8 @@ pub const PROJECT_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.local.
 // Not `model`: it decides what the user pays, and a model the price table
 // doesn't know (or prices by a cheaper prefix) slips past `max_budget_usd`.
 const HARMLESS_PROJECT_KEYS: &[&str] = &[
+    // Only adds a check, and runs no program (roadmap 5.7).
+    "boundaries",
     "reasoning_effort",
     "temperature",
     "max_tokens",

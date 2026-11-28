@@ -19,6 +19,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Architectural boundaries are a check (roadmap 5.7).** `boundaries`
+  names the files under `from` that may not use any `forbid` text: an
+  import, a module, a path. A break fails the round, even with no other
+  checks, and names the file, line and recorded decision. The rules are
+  pinned when the turn starts, and a project file's boundaries apply
+  without trust. See docs/checks.md.
 - **Memory the model saves is treated as its text (roadmap 5.3).**
   - **When saved:** `save_memory` notes are tagged as the model's and
     shown as they are saved. If the session had read someone else's text,

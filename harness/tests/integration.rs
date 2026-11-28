@@ -13236,3 +13236,47 @@ fn invariant_so8_a_hook_made_under_a_built_name_is_caught_at_turn_end() {
     }
     assert!(!r.success, "the run reported success: {:?}", r.events);
 }
+
+// Roadmap 5.7 (SD-7): an architectural boundary is a check. A project's
+// `boundaries` (it adds a check and runs nothing, so it applies untrusted)
+// fails the mandatory round when a changed file under `from` uses a
+// forbidden module, with no other check in the project; a file outside it
+// passes.
+#[test]
+fn a_seeded_boundary_break_blocks() {
+    let go = |file: &str, content: &str| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+        std::fs::write(
+            cwd.join(".buildwithnexus/settings.json"),
+            json!({"boundaries": [{
+                "name": "ui-no-db",
+                "from": ["src/ui/**"],
+                "forbid": ["crate::db"],
+                "why": "ADR 7: the UI reads through the service layer"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        run(&home, &cwd, "edit")
+    };
+    let r = go("src/ui/view.rs", "use crate::db::Pool;\nfn view() {}\n");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    let out = r.text_of("tool_result");
+    assert!(out.contains("boundary break"), "{out}");
+    assert!(
+        out.contains("src/ui/view.rs:1 uses `crate::db` (ui-no-db: ADR 7"),
+        "{out}"
+    );
+    let r = go("src/db/pool.rs", "use crate::db::Pool;\n");
+    assert!(r.success, "{}", r.text_of("tool_result"));
+}

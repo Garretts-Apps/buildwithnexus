@@ -4502,6 +4502,8 @@ pub struct CheckPlan {
     gates: Vec<(WorkCheck, bool)>,
     configured: bool,
     scripts: Vec<(String, Option<String>)>,
+    /// The architectural boundaries, pinned with the checks (roadmap 5.7).
+    boundaries: Vec<crate::config::Boundary>,
 }
 
 impl CheckPlan {
@@ -4670,6 +4672,7 @@ pub fn check_plan(cwd: &Path) -> CheckPlan {
             gates: Vec::new(),
             configured: true,
             scripts: Vec::new(),
+            boundaries: Vec::new(),
         },
         None => {
             let checks = detect_checks(cwd);
@@ -4687,11 +4690,58 @@ pub fn check_plan(cwd: &Path) -> CheckPlan {
                 gates: Vec::new(),
                 configured: false,
                 scripts,
+                boundaries: Vec::new(),
             }
         }
     };
     plan.gates = gates;
+    plan.boundaries = crate::config::load_settings_from_dir(cwd)
+        .map(|s| s.boundaries)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| !b.from.is_empty() && b.forbid.iter().any(|f| !f.trim().is_empty()))
+        .collect();
     plan
+}
+
+/// The boundary breaks in the changed files `rels` (relative paths): each
+/// as `file:line uses `text` (boundary: why)`.
+pub fn boundary_breaks(
+    boundaries: &[crate::config::Boundary],
+    cwd: &Path,
+    rels: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in boundaries {
+        for r in rels {
+            if !b.from.iter().any(|g| crate::hooks::glob_match(g, r)) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(cwd.join(r)) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                if let Some(f) = b
+                    .forbid
+                    .iter()
+                    .find(|f| !f.trim().is_empty() && line.contains(f.as_str()))
+                {
+                    let name = if b.name.is_empty() {
+                        "boundary"
+                    } else {
+                        b.name.as_str()
+                    };
+                    let why = if b.why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", b.why)
+                    };
+                    out.push(format!("{r}:{} uses `{f}` ({name}{why})", n + 1));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Run the plan pinned at the start of the turn. A detected plan whose
@@ -4808,6 +4858,38 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Out
                     .any(|g| crate::hooks::glob_match(g, r) || crate::hooks::glob_match(g, name))
             })
     };
+    // Architectural boundaries (roadmap 5.7): a break fails the round like
+    // a failing check, whatever else ran.
+    let breaks = boundary_breaks(&pinned.boundaries, cwd, &rels);
+    let with_breaks = |mut out: Outcome| {
+        if !breaks.is_empty() {
+            // No project checks is no verdict; a break is one, so that note
+            // must not hide it.
+            if [
+                "no build/test/lint commands detected",
+                "no checks configured",
+                "nothing ran",
+            ]
+            .iter()
+            .any(|p| out.content.contains(p))
+            {
+                out.content = String::new();
+            }
+            out.content = format!(
+                "check_work: FAILED — {} boundary break{}:\n{}\n\n{}",
+                breaks.len(),
+                if breaks.len() == 1 { "" } else { "s" },
+                breaks
+                    .iter()
+                    .map(|b| format!("  {b}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                out.content
+            );
+            out.is_error = true;
+        }
+        out
+    };
     // The gates are checks read from a report: one that can't run leaves
     // no report and fails.
     let all: Vec<WorkCheck> = pinned
@@ -4818,9 +4900,11 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Out
         .chain(gates)
         .collect();
     if pinned.configured && all.is_empty() {
-        return ok("check_work: no checks configured for the changed files.");
+        return with_breaks(ok(
+            "check_work: no checks configured for the changed files.",
+        ));
     }
-    run_checks(&all, cwd, pinned.configured)
+    with_breaks(run_checks(&all, cwd, pinned.configured))
 }
 
 fn package_json_script_bodies(cwd: &Path) -> std::collections::BTreeMap<String, String> {
