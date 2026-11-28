@@ -514,6 +514,29 @@ commit trailer is the witness. Where no keyring is available (Windows, a
 headless Linux machine without a Secret Service), the posture check says the
 head is only in commit trailers.
 
+## Sealed Stores
+
+The trust store (`trusted.json`), the posture-check store (`posture/`) and
+the verifier's rules folder decide what bwn lets a session do. Each carries
+a seal: an HMAC-SHA256 of its contents, under a key kept in the OS keyring,
+or in a 0600 file where there is none. The seals live in `seals.json`.
+
+- **The trust and posture stores:** bwn seals them when it writes them and
+  checks them when it reads them. A store rewritten behind bwn's back reads
+  as empty, so nothing is trusted or accepted and the person is asked again.
+  So does a store that has no seal, so deleting `seals.json` doesn't get
+  past the check. The change goes into the decision log and is named once on
+  stderr.
+- **The rules folder:** it is yours to edit, so bwn doesn't seal it when it
+  changes. The posture check names it when it changed since you last
+  accepted the check, and accepting seals it.
+
+The first run with seals seals the stores as they are. A process outside
+the sandbox, running as you, can read the keyring and forge a seal. Like the
+decision log, this catches a rewrite by something that doesn't know the key:
+a script, an MCP server or a command that edits the file. It does not stop
+a process acting as you on purpose.
+
 ## Permission Gates and the Optional Sandbox
 
 `ask` / `accept-edits` / `auto` / `readonly` modes, allow, ask and deny

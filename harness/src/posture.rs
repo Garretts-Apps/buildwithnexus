@@ -476,6 +476,37 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             )
         });
     }
+    // The verifier's rules folder is the user's to edit; one changed by
+    // something else would quietly turn checks off. Its digest is in the row
+    // key, so a change asks again; accepting seals it (roadmap 2.5, I3).
+    let rules_dir = crate::config::home().join("rules");
+    let rules = crate::seal::rules_bytes(&rules_dir);
+    if !rules.is_empty() {
+        let digest: String = ring::digest::digest(&ring::digest::SHA256, &rules)
+            .as_ref()
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        v.push(match crate::seal::check("rules", &rules) {
+            crate::seal::Verdict::Rewritten => row(
+                "session",
+                "verifier rules",
+                format!(
+                    "~/.buildwithnexus/rules changed since you last accepted this check ({digest}); accepting keeps the change"
+                ),
+                Level::Warn,
+                &format!("rules-changed:{digest}"),
+            ),
+            _ => row(
+                "session",
+                "verifier rules",
+                format!("~/.buildwithnexus/rules, as you last accepted it ({digest})"),
+                Level::Good,
+                &format!("rules:{digest}"),
+            ),
+        });
+    }
     // Where the decision log's head is kept outside the log (roadmap 2.5).
     v.push(match crate::audit::keyring() {
         Some(k) => row(
@@ -811,10 +842,21 @@ fn store_path(sid: &str) -> PathBuf {
         .join(format!("{safe}.txt"))
 }
 
+// A store rewritten outside bwn (its seal no longer matches, roadmap 2.5)
+// reads as not there: the posture question is asked again.
 fn stored(sid: &str) -> Option<String> {
-    std::fs::read_to_string(store_path(sid))
-        .ok()
-        .map(|s| s.trim().to_string())
+    let text = std::fs::read_to_string(store_path(sid)).ok()?;
+    crate::seal::trusted(&seal_name(sid), text.as_bytes()).then(|| text.trim().to_string())
+}
+
+fn seal_name(sid: &str) -> String {
+    format!(
+        "posture/{}",
+        store_path(sid)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    )
 }
 
 fn store(sid: &str, fp: &str) {
@@ -822,7 +864,10 @@ fn store(sid: &str, fp: &str) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(p, format!("{fp}\n"));
+    let text = format!("{fp}\n");
+    if std::fs::write(&p, &text).is_ok() {
+        crate::seal::seal(&seal_name(sid), text.as_bytes());
+    }
 }
 
 /// What the person answered, however they were asked.
@@ -878,6 +923,11 @@ pub fn ensure(
             subject: "posture",
             detail: &format!("{why}; fingerprint {}", &fp[..fp.len().min(16)]),
         });
+        // The rules folder as accepted (roadmap 2.5, I3).
+        let rules = crate::seal::rules_bytes(&crate::config::home().join("rules"));
+        if !rules.is_empty() {
+            crate::seal::seal("rules", &rules);
+        }
         store(sid, &fp);
         *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Accepted {
             sid: sid.to_string(),

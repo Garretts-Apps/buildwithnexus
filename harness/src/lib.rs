@@ -72,6 +72,7 @@ pub mod report;
 pub mod rules;
 pub mod sandbox;
 pub mod screenshot;
+pub mod seal;
 pub mod session;
 pub mod sixel;
 mod system_prompt;

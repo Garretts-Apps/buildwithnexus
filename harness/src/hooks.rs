@@ -1280,12 +1280,26 @@ fn trusted_for_this_run(name: &str, digest: &str) -> bool {
         .is_ok_and(|t| t.iter().any(|(n, d)| n == name && d == digest))
 }
 
+// A trust store rewritten outside bwn (its seal no longer matches, roadmap
+// 2.5) reads as empty: nothing is trusted, so the person is asked again.
 fn read_trust_store() -> Value {
-    std::fs::read_to_string(trust_path())
+    let Ok(t) = std::fs::read_to_string(trust_path()) else {
+        return json!({});
+    };
+    if !crate::seal::trusted("trusted.json", t.as_bytes()) {
+        return json!({});
+    }
+    serde_json::from_str::<Value>(&t)
         .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}))
+}
+
+fn write_trust_store(text: &str) {
+    config::ensure_home();
+    if std::fs::write(trust_path(), text).is_ok() {
+        crate::seal::seal("trusted.json", text.as_bytes());
+    }
 }
 
 /// Has the user trusted exactly this content of `<cwd>/.buildwithnexus/<name>`?
@@ -1450,8 +1464,7 @@ fn store_trust_declining(cwd: &Path, files: &[config::UntrustedProjectFile], dec
         store[&key][format!("{}{PINS}", f.name)] = json!(file_pins(cwd, f));
     }
     if let Ok(t) = serde_json::to_string_pretty(&store) {
-        config::ensure_home();
-        let _ = std::fs::write(trust_path(), t);
+        write_trust_store(&t);
     }
 }
 
@@ -3661,6 +3674,44 @@ mod tests {
         assert_eq!(
             hex(&sha256(&[b'a'; 1000])),
             "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
+        );
+    }
+
+    // I3 (roadmap 2.5): a trust record written by something other than bwn
+    // (an unconfined process forging trust for a project's hooks) is not
+    // trust. bwn's own record holds; the same file rewritten reads as empty.
+    #[test]
+    fn invariant_i3_a_forged_trust_store_trusts_nothing() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-forgetrust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::env::set_var("NEXUS_HOME", h.join("home"));
+        let text =
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#;
+        let file = config::UntrustedProjectFile {
+            name: "settings.json",
+            text: text.into(),
+            keys: vec!["hooks".into()],
+        };
+        store_trust(&proj, std::slice::from_ref(&file));
+        assert!(
+            project_trust(&proj, "settings.json", text).is_some(),
+            "bwn's own record"
+        );
+        // The same record, rewritten behind bwn's back (here, reformatted).
+        let path = trust_path();
+        let forged = std::fs::read_to_string(&path).unwrap().replace('\n', " ");
+        std::fs::write(&path, forged).unwrap();
+        let after = project_trust(&proj, "settings.json", text);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+        assert!(
+            after.is_none(),
+            "a rewritten trust store still trusted the project"
         );
     }
 
