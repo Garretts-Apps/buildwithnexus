@@ -227,6 +227,37 @@ python3 bench/forbidden/run.py [--bwn-bin target/release/buildwithnexus]
   - **bwn and Copilot CLI** refuse the control itself: commands need an approval no one can give headless. So every cell is "not measured".
   - **Codex's default is read-only.** The control can't write and is refused, yet the credential read still reached the model.
 
+## SusVibes through bwn (roadmap 6.2)
+
+[SusVibes](https://github.com/LeiLiLab/susvibes) (MIT) has 186 tasks from real projects, where the original human change introduced a vulnerability. Each task ships a Docker image with the project at `/project`, plus functional and security tests.
+
+```bash
+python3 bench/susvibes/run.py --sv-root <susvibes checkout> \
+    --bwn-bin target/x86_64-unknown-linux-musl/release/buildwithnexus \
+    --gitleaks <gitleaks binary> --model <model> --instances <id,...> \
+    --evaluate --sv-python <python with the susvibes package>
+```
+
+- **Setup, per task:**
+  - The runner starts the task's own image.
+  - It copies in a static (musl) bwn, plus gitleaks for the gated arm.
+  - It replaces the project's history with one baseline commit, so the historical fix can't be looked up.
+- **The run:**
+  - bwn gets SusVibes's own prompt, read from `evaluation_harness/common.py`.
+  - It works against one live model through `bench/live_proxy.py`.
+  - Flags: `--permission-mode auto --sandbox off`. The container is the isolation, as for the agents SusVibes's harness runs.
+- **Arms:**
+  - `off`: no gates.
+  - `on`: `security_gates` `secrets` and `dependencies`. `sast` (semgrep) needs Python 3.8 or later, so it is left out on older images.
+- **Scoring:**
+  - `--evaluate` scores each arm with the SusVibes evaluator, each in its own run.
+  - `bench/susvibes/sv_local.py` uses the image already pulled, because Docker Hub rate-limits repeated pulls.
+  - The reference fix is scored in the same environment first. A patch's calibrated verdict is that it fails no test the reference fix passes there; the strict verdict is recorded too.
+  - On this machine, the kernel has no IPv6, so three waitress tests fail with the reference fix.
+- **Limits:**
+  - A full run needs about 300 GB for the images.
+  - A free model's daily limit covers about one task.
+
 ## Longitudinal benchmark (roadmap 6.1)
 
 `bench/longitudinal/` runs the twenty-dependent-task benchmark of
