@@ -442,6 +442,13 @@ pub(super) fn run_helper(
         }),
     );
     let perm = policy.permission;
+    // An agent file's `model:` runs the helper on that model, at the
+    // session's endpoint (roadmap 4.6).
+    let routed = agent
+        .as_ref()
+        .and_then(|a| a.model.as_deref())
+        .map(|m| p.with_model(m));
+    let p = routed.as_ref().unwrap_or(p);
     let outcome = build_inner(p, perm, role, task, &h.run_cwd, depth + 1, &mut child, None);
     // SubagentStop carries the call and what the helper answered; a hook
     // may send the helper on, as Stop does for the turn.

@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **An agent file can name its model.** `model: small-model` in an agent
+  file's frontmatter runs that helper on that model, at the session's
+  endpoint; `inherit` or no line keeps the session's.
+- **`/voice` sends only what whisper transcribed.** It read a `.txt`
+  beside the audio file as the transcript, so a checkout could plant text
+  that bwn sent as the person's own words. It now reads only what whisper
+  writes in this run, into a folder of bwn's own.
 - **Checks per kind of file (roadmap 4.3).** A `checks` entry's `paths`
   globs (`["*.css"]`) run it only when a matching file changed; its verdict
   counts like any check's.
