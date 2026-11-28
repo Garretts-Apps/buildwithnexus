@@ -7,6 +7,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **macOS: credential stores are write-protected too, wherever they are.**
+  Seatbelt refused reads of a hidden store but not writes, so a store
+  inside a folder commands may write (bwn's own folder under the temp
+  folder, for example) could be changed by a command. The new AU-3 test
+  found it on the macOS cell. The profile now refuses both.
 - **Restricted mode where no sandbox confines commands.** On Windows, or a
   machine with no working backend, every command now asks, in every mode
   and one at a time, after the session's "run unconfined" answer. An allow

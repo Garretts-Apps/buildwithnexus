@@ -1080,10 +1080,13 @@ pub fn seatbelt_profile(
         )),
         Net::Open => {}
     }
-    // Credential stores: no reads of a folder's contents or of a file, and
-    // no connection to the SSH agent's socket (a connect is not a read).
+    // Credential stores: no reads or writes of a folder's contents or of a
+    // file, and no connection to the SSH agent's socket (a connect is not a
+    // read). Writes too: a store that lies inside a writable root (bwn's own
+    // folder under the temp folder, say) would otherwise be writable, as
+    // invariant_au3 found on macOS.
     if !hidden.is_empty() {
-        p.push_str("(deny file-read*");
+        p.push_str("(deny file-read* file-write*");
         for h in hidden {
             let q = sbpl_quote(h);
             if h.is_dir() {
@@ -2354,6 +2357,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join(".netrc"), "x").unwrap();
         let hidden = [dir.join(".ssh"), dir.join(".netrc")];
         let p = seatbelt_profile(Path::new("/w"), &[], None, Net::Open, &hidden);
+        assert!(p.contains("(deny file-read* file-write*"), "{p}");
         let reads = p.split_once("(deny file-read*").unwrap().1;
         assert!(
             reads.contains(&format!("(subpath {})", sbpl_quote(&hidden[0]))),
