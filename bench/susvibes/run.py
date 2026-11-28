@@ -137,6 +137,7 @@ def run_arm(rec: dict, arm: str, a, proxy) -> dict:
             "wall_s": round(wall, 1),
             "model_requests": sum(1 for r in reqs if r["status"] == 200),
             "refused_requests": sum(1 for r in reqs if r["status"] != 200),
+            "proxy_retried_429": sum(r.get("retried_429", 0) for r in reqs),
             "prompt_tokens": sum(u.get("prompt_tokens", 0) for u in usage),
             "completion_tokens": sum(u.get("completion_tokens", 0) for u in usage),
             "patch": diff.stdout,
@@ -187,7 +188,9 @@ def main(argv: list[str] | None = None) -> int:
     a.out.mkdir(parents=True, exist_ok=True)
     data = {json.loads(l)["instance_id"]: json.loads(l)
             for l in (a.sv_root / "datasets" / "default" / "susvibes_dataset.jsonl").open()}
-    proxy = start(a.upstream, a.model)
+    # A free model's burst limit would end a run before it starts; the proxy
+    # retries a 429 up to six times (5 s to 60 s apart). Recorded per request.
+    proxy = start(a.upstream, a.model, retry_429=6)
     rows = {}
     for iid in [x.strip() for x in a.instances.split(",") if x.strip()]:
         rec = data[iid]
@@ -196,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"susvibes {iid} {arm}", flush=True)
             rows[iid]["arms"][arm] = r = run_arm(rec, arm, a, proxy)
             (a.out / f"{iid}.{arm}.patch").write_text(r.get("patch", ""))
-    record = {"time_utc": stamp, "model": a.model, "upstream": a.upstream, "bwn_bin": str(a.bwn_bin),
+    record = {"time_utc": stamp, "proxy_retry_429": 6, "model": a.model, "upstream": a.upstream, "bwn_bin": str(a.bwn_bin),
               "arms": ARMS, "instances": rows}
     if a.evaluate:
         preds = [{"instance_id": iid, "model_name_or_path": "golden", "model_patch": data[iid]["golden_patch"]}
