@@ -254,7 +254,7 @@ mod tests {
     // dirty), a new file, a deletion; bwn's own .bwn/ doesn't.
     #[test]
     fn a_git_snapshot_sees_every_change_but_bwns_own() {
-        let d = std::env::temp_dir().join(format!("bwn-tree-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("bwn-snapshot-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         git(&d, &["init", "-q"]);
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_walk_snapshot_sees_edits_and_unknown_is_never_the_same() {
-        let d = std::env::temp_dir().join(format!("bwn-tree-walk-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("bwn-snapshot-walk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("node_modules")).unwrap();
         std::fs::write(d.join("a.txt"), "1").unwrap();
