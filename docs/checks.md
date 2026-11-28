@@ -78,3 +78,27 @@ them on every round (roadmap 5.7):
   turn that edits them doesn't change the round it is checked by.
 - **In a project file:** a boundary only adds a check and runs no program,
   so it applies without trust.
+
+## Risky changes need a plan
+
+With `"risk_planning": "require"`, a change to any of these waits for an
+approved plan with a threat-model step (roadmap 5.5):
+- authentication or authorization;
+- a database schema or migration;
+- a public API (an OpenAPI or Swagger file, `.proto`, `.graphql`);
+- CI;
+- the dependencies (a manifest, or `npm install`, `cargo add` and the
+  like).
+
+How it works:
+- **Classification:** bwn decides the kind of change from the paths and
+  the command, not from anything the model says.
+- **Before a plan:** such a change is refused in every mode. No approval
+  or allow rule lets it through.
+- **The plan:** switch to PLAN (`/plan`) and approve a plan that includes
+  a step threat-modelling the change. The plan prompt asks for one
+  whenever the work touches these areas. Once it's approved, risky
+  changes go ahead for the rest of that session.
+- **Default:** `"off"`. A project file may set `"require"` without trust,
+  since that only tightens. It can't turn the setting off once you've set
+  `"require"`.

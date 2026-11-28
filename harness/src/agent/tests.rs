@@ -4593,3 +4593,91 @@ fn invariant_cp5_planted_memory_text_triggers_the_provenance_protections() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+// Roadmap 5.5 (SD-4): with `risk_planning: "require"`, a seeded auth change
+// (and a schema, API, CI or dependency change) cannot start without an
+// approved plan with a threat-model step, in any mode, whatever the model
+// says about it; an approved plan without one doesn't count; another
+// session's plan doesn't either. Other edits carry on.
+#[test]
+fn invariant_sd4_a_seeded_auth_change_cannot_start_without_an_approved_plan() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("bwn-sd4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    let cwd = base.canonicalize().unwrap();
+    std::env::set_var("NEXUS_HOME", cwd.join("home"));
+    std::fs::write(
+        cwd.join("home/settings.json"),
+        r#"{"risk_planning":"require"}"#,
+    )
+    .unwrap();
+    clear_risk_plan();
+    clear_untrusted_read();
+    let auth = json!({"path": "src/auth/login.rs", "content": "fn login() {}", "reason": "only a comment, not really auth"});
+    for perm in [Permission::Auto, Permission::Ask, Permission::AcceptEdits] {
+        let why = gate(perm, "write_file", &auth, &cwd).expect("refused");
+        assert!(
+            why.contains("this changes auth") && why.contains("threat-model"),
+            "{why}"
+        );
+    }
+    for (input, kind) in [
+        (
+            json!({"path": "migrations/001_users.sql", "content": "x"}),
+            "a schema",
+        ),
+        (
+            json!({"path": "api/openapi.yaml", "content": "x"}),
+            "a public API",
+        ),
+        (
+            json!({"path": "package.json", "content": "{}"}),
+            "the dependencies",
+        ),
+        (
+            json!({"path": ".github/workflows/ci.yml", "content": "x"}),
+            "CI",
+        ),
+    ] {
+        let why = gate(Permission::Auto, "write_file", &input, &cwd).expect("refused");
+        assert!(why.contains(kind), "{input}: {why}");
+    }
+    let why = gate(
+        Permission::Auto,
+        "run_command",
+        &json!({"command": "npm install left-pad"}),
+        &cwd,
+    )
+    .expect("refused");
+    assert!(why.contains("the dependencies"), "{why}");
+    assert!(gate(
+        Permission::Auto,
+        "write_file",
+        &json!({"path": "src/ui.rs", "content": "x"}),
+        &cwd
+    )
+    .is_none());
+
+    // An approved plan without a threat-model step doesn't count.
+    note_plan_approved(&["Add the login form".into(), "Test it".into()]);
+    assert!(gate(Permission::Auto, "write_file", &auth, &cwd).is_some());
+    // One with it does, for this session only.
+    note_plan_approved(&[
+        "Add the login form".into(),
+        "Threat-model the login change: brute force, session fixation".into(),
+    ]);
+    assert!(gate(Permission::Auto, "write_file", &auth, &cwd).is_none());
+    set_risk_plan_session_for_test("another-session");
+    assert!(gate(Permission::Auto, "write_file", &auth, &cwd).is_some());
+
+    // Off, nothing is required.
+    std::fs::write(cwd.join("home/settings.json"), r#"{"risk_planning":"off"}"#).unwrap();
+    assert!(gate(Permission::Auto, "write_file", &auth, &cwd).is_none());
+
+    clear_risk_plan();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&cwd);
+}

@@ -5901,6 +5901,110 @@ fn command_tokens(cmd: &str) -> impl Iterator<Item = &str> {
     .filter(|t| !t.is_empty())
 }
 
+/// What kind of risky change a call makes (roadmap 5.5), decided from the
+/// paths it touches and the command it runs, never from what the model
+/// says: auth, a schema, a public API, CI or the dependencies. With the
+/// path or command that put it there.
+pub fn risk_class(name: &str, input: &Value, cwd: &Path) -> Option<(&'static str, String)> {
+    if !is_mutating_call(name, input) {
+        return None;
+    }
+    let of_path = |rel: &str| -> Option<&'static str> {
+        let lower = rel.replace('\\', "/").to_ascii_lowercase();
+        let file = lower.rsplit('/').next().unwrap_or(&lower).to_string();
+        let words = |list: &[&str]| {
+            lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| list.contains(&w))
+        };
+        if PROTECTED_PATHS
+            .iter()
+            .any(|p| lower == *p || lower.starts_with(&format!("{p}/")))
+            && !lower.starts_with(".git/")
+        {
+            Some("CI")
+        } else if MANIFESTS.contains(&file.as_str()) {
+            Some("the dependencies")
+        } else if lower.contains("migrations/")
+            || lower.contains("migrate/")
+            || file.ends_with(".sql")
+            || file.ends_with(".prisma")
+            || file.starts_with("schema.")
+        {
+            Some("a schema")
+        } else if file.starts_with("openapi")
+            || file.starts_with("swagger")
+            || file.ends_with(".proto")
+            || file.ends_with(".graphql")
+        {
+            Some("a public API")
+        } else if words(&[
+            "auth",
+            "authn",
+            "authz",
+            "oauth",
+            "login",
+            "logout",
+            "session",
+            "sessions",
+            "password",
+            "passwd",
+            "jwt",
+            "token",
+            "tokens",
+            "crypto",
+            "acl",
+            "rbac",
+            "permission",
+            "permissions",
+            "saml",
+            "oidc",
+            "sso",
+        ]) {
+            Some("auth")
+        } else {
+            None
+        }
+    };
+    for p in touched_paths(name, input, cwd) {
+        let rel = p
+            .strip_prefix(cwd)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(k) = of_path(&rel) {
+            return Some((k, rel));
+        }
+    }
+    let cmd = command_arg_for(name, input)?;
+    let words: Vec<&str> = command_tokens(cmd).collect();
+    let installs = words.windows(2).any(|w| {
+        matches!(
+            (w[0], w[1]),
+            (
+                "npm" | "pnpm" | "yarn" | "bun",
+                "install" | "add" | "i" | "remove" | "uninstall"
+            ) | ("cargo", "add" | "remove" | "update")
+                | (
+                    "pip" | "pip3" | "uv" | "poetry",
+                    "install" | "add" | "uninstall" | "remove"
+                )
+                | ("go", "get")
+                | ("gem" | "bundle", "install" | "add")
+        )
+    });
+    if installs {
+        return Some(("the dependencies", cmd.to_string()));
+    }
+    words.iter().find_map(|w| {
+        let w = w.strip_prefix("./").unwrap_or(w);
+        (w.contains('/') || w.contains('.'))
+            .then(|| of_path(w))
+            .flatten()
+            .map(|k| (k, w.to_string()))
+    })
+}
+
 /// Folders that hold other people's code: packages, vendored copies,
 /// virtual environments and toolchain caches.
 const DEPENDENCY_DIRS: &[&str] = &[
