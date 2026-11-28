@@ -13,6 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod cloud;
+
 /// A background agent that was started.
 pub struct Started {
     pub path: PathBuf,
@@ -255,7 +257,25 @@ pub fn poll() -> Vec<String> {
 /// `buildwithnexus bg run <task>` and `buildwithnexus bg merge <branch>`.
 pub fn cli(args: &[String]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let report = |r: Result<String, String>| match r {
+        Ok(line) => {
+            println!("{line}");
+            0
+        }
+        Err(e) => {
+            eprintln!("buildwithnexus: {e}");
+            1
+        }
+    };
     match args {
+        [verb, flag, rest @ ..] if verb == "run" && flag == "--cloud" && !rest.is_empty() => {
+            report(cloud::dispatch(&cwd, &rest.join(" ")))
+        }
+        [verb, sub, rest @ ..] if verb == "cloud" && sub == "init" => {
+            report(cloud::init(&cwd, rest.iter().any(|a| a == "--force")))
+        }
+        [verb, branch] if verb == "publish" => report(cloud::publish(&cwd, branch)),
+        [verb, branch] if verb == "fetch" => report(cloud::fetch(&cwd, branch)),
         [verb, rest @ ..] if verb == "run" && !rest.is_empty() => {
             let task = rest.join(" ");
             // Outside a session, the settings are the session.
@@ -344,7 +364,7 @@ pub fn cli(args: &[String]) -> i32 {
         },
         _ => {
             eprintln!(
-                "usage: buildwithnexus bg run <task> | bg try <n> <task> | bg merge <branch>"
+                "usage: buildwithnexus bg run [--cloud] <task> | bg try <n> <task> | bg merge <branch> | bg cloud init [--force] | bg fetch <branch> | bg publish <branch>"
             );
             2
         }

@@ -205,7 +205,7 @@ These are features, not controls, so cells are S (shipped), P (partial), N (none
 | MCP client | S (`README.md:877`) | S [S7] | S [S9] | S [S15] | S [S27] | S [S31] | S [S17] | S [S22] | S [S25] | N | S [S35] | S [S33] |
 | Lifecycle hooks | S (`docs/hooks.md:24-28`) | S [S7] | S [S9] | ? | S [S27] | ? | P [S17] | S [S24] | S [S25] | N | S [S35] | ? |
 | Subagents | S (`README.md:839-849`) | S [S7] | S [S9] | ? | S [S27] | ? | S [S17] | S [S22] | S [S26] | N | P [S35] | ? |
-| Background agents | P: timed workflows under the session's permission (`README.md:398-403`) | S [S7] | ? | ? | S [S28] | S, cloud [S30] | S [S17] | ? | S [S26] | N | S [S35] | S [S33] |
+| Background agents | S (updated 28 November): worktree children that can't answer their own approvals and merge only with evidence (roadmap 5.2), and on GitHub Actions with `bg run --cloud` (4.6; `docs/cloud-agents.md`) | S [S7] | ? | ? | S [S28] | S, cloud [S30] | S [S17] | ? | S [S26] | N | S [S35] | S [S33] |
 | Editor integration | P: the `question` tool gets no answer in ACP (`docs/editors.md:36`) | S [S5] | S [S11] | P | S [S27] | S [S30] | S [S18] | S [S22] | N [S25] | N | S [S35] | ? |
 | Headless run, stable JSON contract | S (`README.md:457`) | S [S5] | S [S11] | ? | S [S27] | S [S30] | S [S20] | ? | P [S26] | P | S [S35] | ? |
 | Checkpoints and undo | S (`README.md:414`) | S [N3] | ? | P [S3] | S [S28] | ? | ? | ? | ? | P [S16] | ? | ? |
