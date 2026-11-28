@@ -892,6 +892,7 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
     if cmd["id"] in ("bwn-native", "bwn-npm"):
         env["CUSTOM_API_KEY"] = "sk-bench"
         env["BWN_NO_AUTO_UPDATE"] = "1"
+        env["BWN_ACCEPT_POSTURE"] = "1"
         # NEXUS_HOME stays the install home: the npm launcher finds the binary there.
         # --provider and --base-url override whatever the prompt measurement saved.
         return {
@@ -909,15 +910,13 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
                 "off",
                 "--no-auto-commit",
                 "--no-repo-map",
-                # Headless: the posture check needs its answer.
-                "--accept-posture",
                 "run",
                 TASK_TEXT,
             ],
             "env": env,
             "cwd": str(cwd),
             "methodology": methodology
-            + " Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+            + " Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1. The posture check is answered by BWN_ACCEPT_POSTURE=1, which versions before it ignore (the --accept-posture flag would stop them).",
         }
     if cmd["id"] == "copilot":
         # Copilot CLI's own BYOK variables (`copilot help environment`):
