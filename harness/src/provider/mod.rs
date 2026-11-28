@@ -36,6 +36,34 @@ pub struct Provider {
     /// probe failed (older server) and requests fall back to the OpenAI-compat
     /// /v1 endpoint. A settings `context_tokens` override pre-seeds this cache.
     pub ollama_ctx: std::sync::OnceLock<Option<u32>>,
+    /// How the key is sent (roadmap 4.4): the protocol's own way, or a
+    /// cloud's, whose key goes only to that cloud's hosts.
+    pub auth: Auth,
+}
+
+/// How a provider's key reaches its endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Auth {
+    /// The protocol's own header (`x-api-key`, `Authorization: Bearer`).
+    #[default]
+    Standard,
+    /// Azure OpenAI's `api-key` header, sent only to an Azure endpoint.
+    AzureKey,
+    /// A Google access token (`gcp`), sent only to a Vertex AI endpoint.
+    GoogleToken,
+}
+
+/// The header that carries `p`'s key on an OpenAI-shaped request, or None
+/// when there is no key or the endpoint isn't one the key is bound to.
+pub(crate) fn openai_key_header(p: &Provider, url: &str) -> Option<(&'static str, String)> {
+    let key = p.api_key.as_deref()?;
+    match p.auth {
+        Auth::Standard => Some(("authorization", format!("Bearer {key}"))),
+        Auth::AzureKey => crate::config::cloud_endpoint_ok("azure", url)
+            .is_ok()
+            .then(|| ("api-key", key.to_string())),
+        Auth::GoogleToken => None,
+    }
 }
 
 impl Provider {
@@ -53,6 +81,7 @@ impl Provider {
             max_tokens: self.max_tokens,
             effort: self.effort,
             ollama_ctx: std::sync::OnceLock::new(),
+            auth: self.auth,
         }
     }
 }
@@ -152,6 +181,7 @@ pub fn prewarm(p: &Provider) {
         Protocol::OllamaNative => format!("{}/api/tags", ollama_root(&p.base_url)),
     };
     let key = p.api_key.clone();
+    let header = openai_key_header(p, &url);
     let proto = p.protocol;
     std::thread::spawn(move || {
         let mut req = agent().get(&url).timeout(Duration::from_secs(5));
@@ -159,7 +189,10 @@ pub fn prewarm(p: &Provider) {
             (Protocol::Anthropic, Some(k)) => req
                 .set("x-api-key", k)
                 .set("anthropic-version", "2023-06-01"),
-            (Protocol::OpenAi, Some(k)) => req.set("authorization", &format!("Bearer {k}")),
+            (Protocol::OpenAi, Some(_)) => match &header {
+                Some((h, v)) => req.set(h, v),
+                None => req,
+            },
             _ => req,
         };
         let _ = req.call(); // result ignored — we only want the connection warmed
@@ -229,6 +262,7 @@ pub mod bench {
             max_tokens: None,
             effort: Effort::Medium,
             stream: true,
+            vertex: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -249,6 +283,7 @@ pub mod bench {
             max_tokens: None,
             effort: Effort::Off,
             stream: true,
+            vertex: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -665,6 +700,7 @@ pub fn validate(p: &Provider) -> Result<Option<String>, String> {
         max_tokens: Some(1),
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: p.auth,
     };
     match complete(&probe, &[Msg::User("ping".into())], &[]) {
         Ok(_) => Ok(None),
@@ -961,12 +997,16 @@ fn request_inner(
 ) -> Result<Reply, String> {
     match p.protocol {
         Protocol::Anthropic => {
-            let req = anthropic_request(p)?;
+            let req = match p.auth {
+                Auth::GoogleToken => vertex_request(p, streaming)?,
+                _ => anthropic_request(p)?,
+            };
             let shape = AnthropicBody {
                 model: &p.model,
                 max_tokens: p.max_tokens,
                 effort: p.effort,
                 stream: streaming,
+                vertex: p.auth == Auth::GoogleToken,
             };
             let body = anthropic_bytes(msgs, tools, &shape);
             finish(

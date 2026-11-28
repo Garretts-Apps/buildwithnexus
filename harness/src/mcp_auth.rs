@@ -685,7 +685,7 @@ fn transport_error(url: &str, e: &crate::net::Error) -> String {
 
 // Status and JSON body of an answer, error statuses included; Err only when
 // nothing usable came back.
-fn json_reply(
+pub(crate) fn json_reply(
     url: &str,
     r: Result<crate::net::Response, crate::net::Error>,
 ) -> Result<(u16, Value), String> {
@@ -883,7 +883,7 @@ fn oauth_error_text(v: &Value) -> String {
 
 // ── PKCE and random values ──────────────────────────────────────────────────
 
-fn base64(bytes: &[u8], url_safe: bool) -> String {
+pub(crate) fn base64(bytes: &[u8], url_safe: bool) -> String {
     let table: &[u8; 64] = if url_safe {
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     } else {

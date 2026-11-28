@@ -21,6 +21,7 @@ fn provider(protocol: Protocol, model: &str) -> Provider {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 
@@ -206,6 +207,7 @@ fn anthropic(p: &Provider, msgs: &[Msg], tools: &[ToolDef], stream: bool) -> Vec
         max_tokens: p.max_tokens,
         effort: p.effort,
         stream,
+        vertex: false,
     };
     anthropic_bytes(msgs, tools, &shape)
 }

@@ -1948,6 +1948,7 @@ fn the_interactive_build_never_waits_for_the_model_server() {
         max_tokens: None,
         effort: provider.effort,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let answer = std::thread::spawn(move || probe_server(probe))
         .join()
@@ -2004,6 +2005,7 @@ fn an_unreachable_ollama_is_still_reported_by_the_deferred_probe() {
         max_tokens: None,
         effort: provider.effort,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     tui::capture_start();
     let answer = probe_server(probe);
@@ -2035,4 +2037,82 @@ fn invariant_in2_a_bad_permission_setting_runs_as_readonly() {
     }
     assert!(matches!(permission_from(None, "auto"), Permission::Auto));
     assert!(matches!(permission_from(None, "ask"), Permission::Ask));
+}
+
+// Roadmap 4.4, IH-1: an Azure key is bound to Azure's hosts. A base_url
+// that only looks like one, or any other host, gets no key: the provider
+// isn't built, and a request header is never made for it.
+#[test]
+fn invariant_ih1_an_azure_key_goes_only_to_an_azure_endpoint() {
+    let azure = |url: Option<&str>| Settings {
+        provider: "azure".into(),
+        permission: "ask".into(),
+        base_url: url.map(str::to_string),
+        ..Default::default()
+    };
+    let key = "azure-test-key";
+    for url in [
+        "https://evil.example/openai/v1",
+        "https://res.openai.azure.com.evil.example/openai/v1",
+        "https://openai.azure.com/openai/v1",
+        "https://.openai.azure.com/openai/v1",
+        "https://user:pw@res.openai.azure.com/openai/v1",
+        "https://res.openai.azure.com:8443/openai/v1",
+        "https://127.0.0.1/openai/v1",
+        "http://res.openai.azure.com/openai/v1",
+    ] {
+        match build_provider_with_key(&azure(Some(url)), Some(key)) {
+            Ok(_) => panic!("{url}: the Azure key would be sent there"),
+            Err(e) => assert!(
+                e.contains("refusing") || e.contains("non-HTTPS"),
+                "{url}: {e}"
+            ),
+        }
+    }
+    let e = build_provider_with_key(&azure(None), Some(key))
+        .err()
+        .unwrap();
+    assert!(e.contains("needs base_url"), "{e}");
+    for url in [
+        "https://res.openai.azure.com/openai/v1",
+        "https://RES.services.ai.azure.com/openai/v1/",
+        "https://res.cognitiveservices.azure.com:443/openai/v1",
+    ] {
+        let p = build_provider_with_key(&azure(Some(url)), Some(key)).unwrap();
+        assert_eq!(p.auth, provider::Auth::AzureKey);
+        let at = format!("{url}/chat/completions");
+        assert_eq!(
+            provider::openai_key_header(&p, &at),
+            Some(("api-key", key.to_string())),
+            "{url}"
+        );
+        // The same provider asked to reach another host has no header.
+        assert_eq!(
+            provider::openai_key_header(&p, "https://evil.example/chat/completions"),
+            None
+        );
+    }
+    // Every other preset keeps its own header.
+    let mut s = azure(None);
+    s.provider = "openai".into();
+    let p = build_provider_with_key(&s, Some("k")).unwrap();
+    assert_eq!(
+        provider::openai_key_header(&p, "https://api.openai.com/v1/chat/completions"),
+        Some(("authorization", "Bearer k".to_string()))
+    );
+}
+
+#[test]
+fn a_vertex_base_url_off_googles_hosts_is_refused() {
+    let s = Settings {
+        provider: "vertex".into(),
+        permission: "ask".into(),
+        base_url: Some("https://evil.example/v1/projects/p/locations/r".into()),
+        ..Default::default()
+    };
+    let e = build_provider(&s).err().unwrap();
+    assert!(e.contains("refusing"), "{e}");
+    let mut s = s;
+    s.base_url = None;
+    assert!(build_provider(&s).err().unwrap().contains("needs base_url"));
 }

@@ -3251,6 +3251,16 @@ pub(crate) fn credential_stores(home: &Path) -> Vec<PathBuf> {
             .filter(|f| **f != ".env")
             .map(|f| home.join(f)),
     );
+    // Google's credentials (roadmap 4.4): the key file the environment
+    // names, wherever it is, and gcloud's folder on Windows.
+    if let Some(f) = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|f| !f.is_empty()) {
+        v.push(PathBuf::from(f));
+    }
+    if cfg!(windows) {
+        if let Some(a) = std::env::var_os("APPDATA") {
+            v.push(PathBuf::from(a).join("gcloud"));
+        }
+    }
     v
 }
 

@@ -111,6 +111,7 @@ fn provider_for(base_url: &str, key: Option<&str>) -> Provider {
         max_tokens: None,
         effort: crate::config::Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 
@@ -463,6 +464,7 @@ fn a_stalled_response_names_the_read_timeout_setting() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let m = explain_failure(
         &p,
@@ -547,6 +549,7 @@ fn validate_passes_on_ok_and_reports_auth_and_connect_failures() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     assert!(validate(&p).is_ok(), "200 must validate");
     let err = validate(&p).unwrap_err();
@@ -583,6 +586,7 @@ fn anthropic_effort_body(
         max_tokens,
         effort,
         stream: false,
+        vertex: false,
     };
     parsed(anthropic_bytes(msgs, tools, &shape))
 }
@@ -1349,6 +1353,7 @@ fn ollama_retries_without_tools_when_the_model_has_none_and_remembers() {
         effort: Effort::Off,
         // Pre-seeded so no /api/show probe consumes a scripted reply.
         ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",
@@ -1399,6 +1404,7 @@ fn ollama_retries_without_thinking_when_the_model_has_none_and_remembers() {
         max_tokens: None,
         effort: Effort::High,
         ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        auth: Default::default(),
     };
     let msgs = [Msg::User("hi".into())];
     assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
@@ -1804,6 +1810,7 @@ fn redirect_is_refused_and_key_never_reaches_the_other_host() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let err = complete(&p, &[Msg::User("hi".into())], &[]).unwrap_err();
     handle.join().unwrap();
@@ -2366,6 +2373,7 @@ fn ollama_at(base: String, model: &str) -> Provider {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 
@@ -2687,6 +2695,7 @@ fn request_records_every_completed_reply_into_the_ledger() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let before = crate::usage::snapshot();
     complete(&p, &[Msg::User("ping".into())], &[]).unwrap();
@@ -2902,6 +2911,7 @@ fn loopback_sends_native_tools_first_then_flattens_after_400_and_remembers() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",
@@ -2952,6 +2962,7 @@ fn loopback_keeps_native_tools_when_the_server_accepts_them() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",
@@ -2972,4 +2983,108 @@ fn loopback_keeps_native_tools_when_the_server_accepts_them() {
         "{}/chat/completions",
         p.base_url
     )));
+}
+
+// Roadmap 4.4, IH-1: a Vertex request goes only to a Vertex AI host, and
+// that is decided before any credential is read: a look-alike endpoint is
+// refused with no token fetched (here there are no credentials at all, and
+// the refusal is still about the host).
+#[test]
+fn invariant_ih1_vertex_credentials_go_only_to_a_vertex_endpoint() {
+    let vertex = |base: &str, model: &str| Provider {
+        protocol: Protocol::Anthropic,
+        base_url: base.into(),
+        api_key: None,
+        model: model.into(),
+        context_tokens: 200_000,
+        temperature: None,
+        max_tokens: None,
+        effort: Effort::Off,
+        ollama_ctx: std::sync::OnceLock::new(),
+        auth: Auth::GoogleToken,
+    };
+    for base in [
+        "https://evil.example/v1/projects/p/locations/us-east5",
+        "https://us-east5-aiplatform.googleapis.com.evil.example/v1",
+        "https://a.b-aiplatform.googleapis.com/v1",
+        "https://-aiplatform.googleapis.com/v1",
+        "http://us-east5-aiplatform.googleapis.com/v1",
+        "https://x@us-east5-aiplatform.googleapis.com/v1",
+        "http://127.0.0.1:9/v1",
+    ] {
+        let e = vertex_request(&vertex(base, "claude-sonnet-4-6"), true)
+            .err()
+            .unwrap_or_else(|| panic!("{base}: request built"));
+        assert!(
+            e.starts_with("refusing to send Google credentials"),
+            "{base}: {e}"
+        );
+    }
+    // A model name can't move the request to another path.
+    let ok_base = "https://us-east5-aiplatform.googleapis.com/v1/projects/p/locations/us-east5";
+    for model in ["../../x", "m?alt=x", "a:rawPredict#"] {
+        let e = vertex_request(&vertex(ok_base, model), true).err().unwrap();
+        assert!(e.contains("isn't a Vertex AI model name"), "{model}: {e}");
+    }
+    for host in [
+        "https://aiplatform.googleapis.com/v1/projects/p/locations/global",
+        ok_base,
+    ] {
+        assert!(
+            crate::config::cloud_endpoint_ok("vertex", host).is_ok(),
+            "{host}"
+        );
+    }
+    // A Vertex provider never builds an OpenAI-style key header either.
+    assert_eq!(openai_key_header(&vertex(ok_base, "m"), ok_base), None);
+}
+
+// Vertex's body: the version it asks for, no model (it is in the URL), and
+// otherwise the Anthropic body unchanged.
+#[test]
+fn a_vertex_body_names_the_api_version_and_not_the_model() {
+    let msgs = [Msg::User("hi".into())];
+    let shape = |vertex| AnthropicBody {
+        model: "claude-sonnet-4-6",
+        max_tokens: None,
+        effort: Effort::Off,
+        stream: true,
+        vertex,
+    };
+    let v: Value = serde_json::from_slice(&anthropic_bytes(&msgs, &[], &shape(true))).unwrap();
+    let a: Value = serde_json::from_slice(&anthropic_bytes(&msgs, &[], &shape(false))).unwrap();
+    assert_eq!(v["anthropic_version"], "vertex-2023-10-16");
+    assert!(v.get("model").is_none());
+    assert_eq!(a["model"], "claude-sonnet-4-6");
+    let mut a2 = a.clone();
+    a2.as_object_mut().unwrap().remove("model");
+    let mut v2 = v.clone();
+    v2.as_object_mut().unwrap().remove("anthropic_version");
+    assert_eq!(a2, v2);
+}
+
+// A cloud's model names find the model's version and price.
+#[test]
+fn cloud_model_names_resolve_to_the_model() {
+    for (cloud, bare) in [
+        ("claude-sonnet-4-5@20250929", "claude-sonnet-4-5"),
+        ("us.anthropic.claude-sonnet-4-6", "claude-sonnet-4-6"),
+        (
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "claude-haiku-4-5-20251001",
+        ),
+        ("claude-opus-4-8", "claude-opus-4-8"),
+        ("vendor/anthropic.x", "vendor/anthropic.x"),
+    ] {
+        assert_eq!(crate::usage::bare_model(cloud), bare, "{cloud}");
+    }
+    assert_eq!(claude_version("claude-sonnet-4-5@20250929"), Some((4, 5)));
+    assert_eq!(
+        claude_version("us.anthropic.claude-opus-4-8-v1:0"),
+        Some((4, 8))
+    );
+    assert_eq!(
+        crate::usage::price_for("us.anthropic.claude-sonnet-4-6").is_some(),
+        crate::usage::price_for("claude-sonnet-4-6").is_some()
+    );
 }

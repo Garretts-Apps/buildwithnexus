@@ -8,6 +8,9 @@ pub(super) struct AnthropicBody<'a> {
     pub(super) max_tokens: Option<u32>,
     pub(super) effort: Effort,
     pub(super) stream: bool,
+    /// Vertex AI's form: the model is in the URL, and the body names the
+    /// API version instead.
+    pub(super) vertex: bool,
 }
 
 const CACHE_CONTROL: &str = "\"cache_control\":{\"type\":\"ephemeral\"},";
@@ -43,7 +46,11 @@ pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody
     }
 
     let mut j = Json::with_capacity(size_hint(msgs, tools));
-    j.raw("{\"max_tokens\":");
+    j.raw(if o.vertex {
+        "{\"anthropic_version\":\"vertex-2023-10-16\",\"max_tokens\":"
+    } else {
+        "{\"max_tokens\":"
+    });
     j.val(&max_tokens);
     j.raw(",\"messages\":[");
     let last = msgs.iter().rposition(|m| !matches!(m, Msg::System(_)));
@@ -127,8 +134,11 @@ pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody
             }
         }
     }
-    j.raw("],\"model\":");
-    j.str(o.model);
+    j.raw("]");
+    if !o.vertex {
+        j.raw(",\"model\":");
+        j.str(o.model);
+    }
     if budget.is_some() && adaptive {
         j.raw(",\"output_config\":{\"effort\":\"");
         j.raw(o.effort.as_str());
@@ -255,6 +265,32 @@ pub(super) fn anthropic_request(p: &Provider) -> Result<crate::net::Request, Str
         .set("content-type", "application/json"))
 }
 
+/// A Vertex AI request for `p`'s model: `rawPredict`, or
+/// `streamRawPredict` when streaming, under the endpoint's project and
+/// region, with a Google access token. The token is fetched only once the
+/// endpoint is known to be Vertex AI's.
+pub(super) fn vertex_request(p: &Provider, streaming: bool) -> Result<crate::net::Request, String> {
+    let verb = if streaming {
+        "streamRawPredict"
+    } else {
+        "rawPredict"
+    };
+    let at = url(
+        p,
+        &format!("/publishers/anthropic/models/{}:{verb}", p.model.trim()),
+    );
+    crate::config::cloud_endpoint_ok("vertex", &at)
+        .map_err(|why| format!("refusing to send Google credentials: {why}"))?;
+    if p.model.contains(['/', '?', '#', ':']) || p.model.trim().is_empty() {
+        return Err(format!("`{}` isn't a Vertex AI model name", p.model));
+    }
+    let token = crate::gcp::access_token()?;
+    Ok(agent()
+        .post(&at)
+        .set("authorization", &format!("Bearer {token}"))
+        .set("content-type", "application/json"))
+}
+
 // Thinking budgets for the `budget_tokens` form (models before Claude 4.6).
 pub(super) fn thinking_budget(effort: Effort) -> Option<u32> {
     match effort {
@@ -269,7 +305,7 @@ pub(super) fn thinking_budget(effort: Effort) -> Option<u32> {
 // "claude-opus-4-6", "claude-sonnet-4-20250514" (date, not a minor),
 // "claude-3-7-sonnet-…". None for anything that isn't a versioned claude-* id.
 pub(super) fn claude_version(model: &str) -> Option<(u32, u32)> {
-    let rest = model.trim().to_ascii_lowercase();
+    let rest = crate::usage::bare_model(model);
     let rest = rest.strip_prefix("claude-")?;
     let mut parts = rest.split('-').filter_map(|seg| seg.parse::<u32>().ok());
     let major = parts.next()?;

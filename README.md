@@ -216,16 +216,14 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 | xAI (Grok) | remote | `XAI_API_KEY` |
 | Mistral | remote | `MISTRAL_API_KEY` |
 | DeepSeek | remote | `DEEPSEEK_API_KEY` |
+| Azure OpenAI | your cloud | `AZURE_OPENAI_API_KEY` |
+| Claude on Vertex AI | your cloud | Google credentials |
 | Ollama | local | — |
 | llama.cpp server | local | — |
 | LM Studio | local | — |
 
-Gemini, xAI, Mistral and DeepSeek use their own OpenAI-compatible hosts
-(DeepSeek's has no `/v1`; Google's compatibility endpoint is still a beta).
-A bare `gemini…` name selects the Gemini preset. `"route_gemini":
-"openrouter"` or `--route-gemini openrouter` restores the old OpenRouter
-`google/<name>` route. With no settings file, a headless run still prefers
-an Anthropic, OpenAI, OpenRouter, Groq, or Hugging Face key when one is set.
+Gemini routing and the cloud providers, whose keys go only to their own
+hosts: [Providers](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/providers.md).
 
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600). A key is typed hidden (dots, then only

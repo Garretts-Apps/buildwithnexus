@@ -974,6 +974,7 @@ fn spawn_startup_probes(provider: &Provider) {
             max_tokens: provider.max_tokens,
             effort: provider.effort,
             ollama_ctx: std::sync::OnceLock::new(),
+            auth: provider.auth,
         });
     std::thread::spawn(move || {
         check_and_offer_install_dependencies();

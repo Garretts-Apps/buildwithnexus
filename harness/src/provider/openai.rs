@@ -174,11 +174,10 @@ fn image_part(j: &mut Json, (media_type, data): &(String, String)) {
 }
 
 pub(super) fn openai_request_at(p: &Provider, base: &str) -> crate::net::Request {
-    let req = agent()
-        .post(&format!("{}/chat/completions", base.trim_end_matches('/')))
-        .set("content-type", "application/json");
-    match &p.api_key {
-        Some(key) => req.set("authorization", &format!("Bearer {key}")),
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let req = agent().post(&url).set("content-type", "application/json");
+    match super::openai_key_header(p, &url) {
+        Some((h, v)) => req.set(h, &v),
         None => req,
     }
 }

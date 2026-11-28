@@ -52,6 +52,7 @@ pub mod config;
 mod debug_panel;
 pub mod egress;
 pub mod evidence;
+pub mod gcp;
 pub mod gitbroker;
 pub mod graphics;
 pub mod highlight;
@@ -1152,8 +1153,17 @@ fn build_provider_deferring(
             ));
         }
         Some(u) => u.clone(),
+        None if preset.base_url.is_empty() => {
+            return Err(format!(
+                "{} needs base_url: {}",
+                preset.id,
+                config::cloud_endpoint_example(preset.id)
+            ));
+        }
         None => preset.base_url.to_string(),
     };
+    config::cloud_endpoint_ok(preset.id, &base_url)
+        .map_err(|why| format!("refusing to send {}: {why}", preset.env_key))?;
     let model = if s.model.is_empty() {
         preset.default_model.to_string()
     } else {
@@ -1173,13 +1183,17 @@ fn build_provider_deferring(
             ));
         }
         api_key
-    } else if preset.env_key.is_empty() {
+    } else if preset.env_key.is_empty() || preset.id == "vertex" {
+        // Vertex's credentials are a file, exchanged for a token per request.
         None
     } else {
         key.map(str::to_string)
             .or_else(|| config::load_key(preset.env_key))
     };
-    if !preset.env_key.is_empty() && api_key.is_none() {
+    if preset.id == "vertex" && gcp::credentials_path().is_none() {
+        return Err("no Google credentials: set GOOGLE_APPLICATION_CREDENTIALS to a service-account key, or run `gcloud auth application-default login`".into());
+    }
+    if !preset.env_key.is_empty() && api_key.is_none() && preset.id != "vertex" {
         return Err(format!(
             "{} not set; run `buildwithnexus init`",
             preset.env_key
@@ -1202,7 +1216,7 @@ fn build_provider_deferring(
         report::notice(&format!("  ⚠ {w}"));
     }
     let mut context_tokens = match preset.id {
-        "anthropic" => 200_000,
+        "anthropic" | "vertex" => 200_000,
         _ if preset.local => 8_192,
         _ => 128_000,
     };
@@ -1238,6 +1252,11 @@ fn build_provider_deferring(
         // rejecting the whole settings file.
         effort: config::Effort::parse(&s.effort).unwrap_or_default(),
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: match preset.id {
+            "azure" => provider::Auth::AzureKey,
+            "vertex" => provider::Auth::GoogleToken,
+            _ => provider::Auth::Standard,
+        },
     };
     if let Some(n) = s.context_tokens {
         if provider.protocol == config::Protocol::OllamaNative {
