@@ -33,6 +33,12 @@ parses and holds no finding; a scanner that crashed fails.
 { "checks": [{ "name": "sast", "command": "semgrep scan --sarif --quiet", "format": "sarif", "kind": "security" }] }
 ```
 
-`"security_gates": ["secrets", "dependencies"]` adds two scanners every
-change must pass: gitleaks on every change, and osv-scanner when a manifest
-or lockfile changed. A gate whose scanner isn't installed blocks.
+`"security_gates"` adds scanners every change must pass, each read from its
+report: `"secrets"` (gitleaks, on every change), `"dependencies"`
+(osv-scanner, when a manifest or lockfile changed), `"sast"` (semgrep over
+the changed files, warnings and errors block), `"config"` (`trivy config`,
+when a Dockerfile, Terraform, Kubernetes or CI file changed) and `"sbom"`
+(syft regenerates `bom.json` as CycloneDX when a manifest or lockfile
+changed; the commit's evidence record names it). A
+gate whose scanner isn't installed blocks. semgrep's `--config auto`
+downloads its rules, so its host must be allowed in `network.allow`.

@@ -12596,3 +12596,255 @@ if grep -qs vulnerable-pkg package.json; then echo '{"results":[{"packages":[{"p
     let (r, _) = run_gated(edit("cfg.txt", "x"), json!(["secrets"]), false, &none);
     assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
 }
+
+// 3.6 (SD-1, second slice): seeded SAST and configuration findings block;
+// SAST reads the changed files; configuration scanning runs only when a
+// configuration file changed.
+#[cfg(unix)]
+#[test]
+fn invariant_sd1_sast_and_configuration_findings_block() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = tmp("stubs");
+    let stub = |name: &str, body: &str| {
+        let p = stubs.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let sarif = |rule: &str| {
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"stub"}}}},"results":[{{"ruleId":"{rule}","level":"error","message":{{"text":"seeded"}}}}]}}]}}"#
+        )
+    };
+    let clean = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"stub"}},"results":[]}]}"#;
+    stub(
+        "semgrep",
+        &format!(
+            "found=0; for a in \"$@\"; do [ -f \"$a\" ] && grep -qs 'eval(' \"$a\" && found=1; done\nif [ $found = 1 ]; then echo '{}'; else echo '{clean}'; fi",
+            sarif("js-eval")
+        ),
+    );
+    stub(
+        "trivy",
+        &format!(
+            "touch TRIVY_RAN\nif grep -qs 'USER root' Dockerfile; then echo '{}'; else echo '{clean}'; fi",
+            sarif("DS002")
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_gated = |file: &str, content: &str, gates: Value| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "security_gates", gates);
+        let r = run_env(
+            &home,
+            &cwd,
+            &["--json", "run", "edit"],
+            &[("PATH", path.as_str())],
+        );
+        (r, cwd)
+    };
+    let (r, _) = run_gated("app.js", "run(eval(input))\n", json!(["sast"]));
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("js-eval"));
+    let (r, _) = run_gated("app.js", "run(input)\n", json!(["sast"]));
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    let (r, _) = run_gated("Dockerfile", "FROM alpine\nUSER root\n", json!(["config"]));
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    let (r, cwd) = run_gated("notes.txt", "n", json!(["config"]));
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(!cwd.join("TRIVY_RAN").exists());
+}
+
+// 3.7: with the `sbom` gate, a change to the dependencies regenerates the
+// SBOM through a real tool (a stub syft here); a missing tool blocks.
+#[cfg(unix)]
+#[test]
+fn the_sbom_is_regenerated_when_dependencies_change() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = tmp("stubs");
+    let p = stubs.join("syft");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nbom='{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"components\":[]}'\necho \"$bom\" > bom.json\necho \"$bom\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let go = |with_tool: bool| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call(
+                "w",
+                "write_file",
+                json!({"path": "requirements.txt", "content": "flask\n"}),
+            ),
+            finish("done"),
+            finish("done"),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "security_gates", json!(["sbom"]));
+        let env = [(
+            "PATH",
+            if with_tool {
+                path.as_str()
+            } else {
+                "/usr/bin:/bin"
+            },
+        )];
+        (run_env(&home, &cwd, &["--json", "run", "edit"], &env), cwd)
+    };
+    let (r, cwd) = go(true);
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(std::fs::read_to_string(cwd.join("bom.json"))
+        .unwrap()
+        .contains("CycloneDX"));
+    let (r, _) = go(false);
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+}
+
+// Roadmap 4.2 (CP-1): one table of gate decisions, the same answer through
+// `--json` and through ACP. An ask is a refusal for want of a terminal in
+// `--json`, and a session/request_permission in ACP (answered reject here);
+// an allow runs unasked in both; a deny is refused unasked in both. The
+// terminal goes through the same gate function as both.
+#[test]
+fn gate_decisions_are_the_same_in_json_and_acp() {
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum D {
+        Allow,
+        Ask,
+        Deny,
+    }
+    let cases: Vec<(&str, &str, Value, Value, D)> = vec![
+        (
+            "ask",
+            "read_file",
+            json!({"path": "a.txt"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "ask",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "ask",
+            "run_command",
+            json!({"command": "touch t.txt"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "ask",
+            "run_command",
+            json!({"command": "echo hi"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "auto",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "auto",
+            "run_command",
+            json!({"command": "rm -rf /"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "readonly",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Deny,
+        ),
+        (
+            "auto",
+            "run_command",
+            json!({"command": "touch t.txt"}),
+            json!({"permissions": {"deny": ["run_command(touch *)"]}}),
+            D::Deny,
+        ),
+    ];
+    let settings = |home: &Path, extra: &Value| {
+        if let Some(m) = extra.as_object() {
+            for (k, v) in m {
+                add_user_setting(home, k, v.clone());
+            }
+        }
+    };
+    for (perm, tool, input, extra, want) in cases {
+        let label = format!("{perm} {tool} {input} {extra}");
+        // --json.
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(cwd.join("a.txt"), "a").unwrap();
+        let port = serve(vec![tool_call("c1", tool, input.clone()), finish("done")]);
+        write_config(&home, "ollama", perm, port);
+        settings(&home, &extra);
+        let r = run(&home, &cwd, "do it");
+        let denied = r.text_of("tool_denied");
+        let json_d = if denied.contains("no interactive terminal") {
+            D::Ask
+        } else if !denied.is_empty() {
+            D::Deny
+        } else {
+            D::Allow
+        };
+        assert_eq!(json_d, want, "--json {label}: {denied}");
+        // ACP.
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(cwd.join("a.txt"), "a").unwrap();
+        let (port, _) = serve_sse(vec![tool_call("c1", tool, input.clone()), text("done")]);
+        write_config(&home, "llamacpp", perm, port);
+        settings(&home, &extra);
+        let mut acp = Acp::start(&home, &cwd, &[]);
+        acp_init(&mut acp, json!({}));
+        let sid = acp_new_session(&mut acp, &cwd);
+        acp.call(
+            "session/prompt",
+            prompt(&sid, "do it"),
+            &mut choose("reject_once"),
+        );
+        let asked = !acp.agent_requests("session/request_permission").is_empty();
+        let completed = acp
+            .updates()
+            .iter()
+            .any(|u| u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed");
+        let acp_d = if asked {
+            D::Ask
+        } else if completed {
+            D::Allow
+        } else {
+            D::Deny
+        };
+        let _ = acp.close();
+        assert_eq!(acp_d, want, "ACP {label}");
+    }
+}

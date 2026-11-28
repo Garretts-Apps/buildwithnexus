@@ -65,6 +65,8 @@ pub fn record(files: &[(String, String)]) -> Option<String> {
         },
         "verifier": facts.verifier,
         "decision_log": crate::audit::head().map(|(a, b, n)| json!([a, b, n])),
+        // The SBOM as committed, when the change carries one.
+        "sbom": files.iter().find(|(p, _)| p == "bom.json").map(|(_, b)| b),
     });
     let text = serde_json::to_string(&rec).ok()?;
     let hash = sha256_hex(text.as_bytes());

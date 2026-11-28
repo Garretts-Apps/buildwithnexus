@@ -7,6 +7,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **`compaction` setting (roadmap 4.5).** `{"threshold_percent": 60,
+  "keep_recent": 10}` compacts at 60% of the model's context and keeps the
+  last 10 messages verbatim (defaults 80 and 6).
+- **The untrusted mark survives compaction and resume (roadmap 4.5).** A
+  session that read a web page or an MCP result found its mark again on
+  resume only from the labelled result, which compaction could summarize
+  away; auto mode then stopped asking. The summary now carries the label.
+- **SAST and configuration gates (roadmap 3.6).** `security_gates` also
+  takes `"sast"` (semgrep over the turn's changed files) and `"config"`
+  (`trivy config` when a Dockerfile, Terraform, Kubernetes or CI file
+  changed). Their findings block like a failing check. `"sbom"`
+  regenerates `bom.json` with syft (CycloneDX) whenever a manifest or
+  lockfile changed, and the commit's evidence record names it.
 - **The store-seal key is made once, even when two bwn start together.**
   Without a keyring the key is a file; two processes (or a reader that
   caught it half-written) could each make one, and the trust and
