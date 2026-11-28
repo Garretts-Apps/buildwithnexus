@@ -11273,3 +11273,195 @@ fn invariant_ac1_the_decision_log_lists_every_decision_and_catches_tampering() {
     assert_eq!(verify(&shortp, &[]).0, Some(0));
     assert_eq!(verify(&shortp, &["--head", &head]).0, Some(1));
 }
+
+// Roadmap 2.5, D3: the chain's head is anchored outside the log. At turn
+// end it goes to the keyring (a test folder here), `audit head` prints it,
+// and a log rewritten with a consistent chain fails against it. A commit
+// bwn makes carries it as a trailer.
+#[test]
+fn invariant_ac1_a_rewritten_chain_fails_against_the_anchored_head() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let keyring = tmp("keyring");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    let port = serve(vec![
+        tool_call("c1", "write_file", json!({"path": "a.txt", "content": "x"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let mut cfg: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("config.json")).unwrap()).unwrap();
+    cfg["auto_commit"] = json!(true);
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let keyring_s = keyring.to_string_lossy().into_owned();
+    let env = [
+        ("BWN_TEST_KEYRING", keyring_s.as_str()),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+    ];
+    let r = run_env(&home, &cwd, &["--json", "run", "write a"], &env);
+    assert!(r.success, "stderr: {}", r.stderr);
+    // `audit head` and `audit path` find them.
+    let audit = |sub: &str| {
+        let o = Command::new(BIN)
+            .args(["audit", sub])
+            .env("NEXUS_HOME", &home)
+            .env("BWN_TEST_KEYRING", &keyring)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let head = audit("head");
+    let log = std::path::PathBuf::from(audit("path"));
+    assert_eq!(head.len(), 64, "head {head:?}");
+    let verify = |p: &Path, h: &str| {
+        Command::new(env!("CARGO_BIN_EXE_bwn-audit-verify"))
+            .arg(p)
+            .args(["--head", h])
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    assert_eq!(verify(&log, &head), Some(0));
+    // The commit carries the trailer, with the head as of the write.
+    let msg = String::from_utf8_lossy(&git(&["log", "-1", "--format=%B"]).stdout).into_owned();
+    assert!(msg.contains("Bwn-Decision-Log: "), "{msg}");
+    // A consistent rewrite: every line recomputed, a decision changed. It
+    // verifies alone, and fails against the anchored head.
+    let text = std::fs::read_to_string(&log).unwrap();
+    let session = log.file_stem().unwrap().to_string_lossy().into_owned();
+    let sha = |b: &[u8]| -> String {
+        use std::fmt::Write;
+        let d = ring_like_sha256(b);
+        let mut s = String::new();
+        for x in d {
+            let _ = write!(s, "{x:02x}");
+        }
+        s
+    };
+    let mut prev = sha(format!("bwn-audit-genesis:{session}").as_bytes());
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut v: Value = serde_json::from_str(line).unwrap();
+        v["prev"] = json!(prev);
+        if v["subject"] == "write_file" {
+            v["detail"] = json!("something else entirely");
+        }
+        let l = v.to_string();
+        prev = sha(l.as_bytes());
+        out.push_str(&l);
+        out.push('\n');
+    }
+    let alt = tmp("rewritten").join(log.file_name().unwrap());
+    std::fs::write(&alt, out).unwrap();
+    assert_eq!(
+        Command::new(env!("CARGO_BIN_EXE_bwn-audit-verify"))
+            .arg(&alt)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0),
+        "a consistent rewrite verifies on its own"
+    );
+    assert_eq!(verify(&alt, &head), Some(1), "but not against the anchor");
+}
+
+// SHA-256 written out for the test, so the rewrite above shares no code
+// with either bwn or its verifier.
+fn ring_like_sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h;
+        for i in 0..64 {
+            let s1 = a[4].rotate_right(6) ^ a[4].rotate_right(11) ^ a[4].rotate_right(25);
+            let ch = (a[4] & a[5]) ^ (!a[4] & a[6]);
+            let t1 = a[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a[0].rotate_right(2) ^ a[0].rotate_right(13) ^ a[0].rotate_right(22);
+            let maj = (a[0] & a[1]) ^ (a[0] & a[2]) ^ (a[1] & a[2]);
+            let t2 = s0.wrapping_add(maj);
+            a = [
+                t1.wrapping_add(t2),
+                a[0],
+                a[1],
+                a[2],
+                a[3].wrapping_add(t1),
+                a[4],
+                a[5],
+                a[6],
+            ];
+        }
+        for (x, y) in h.iter_mut().zip(a) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}

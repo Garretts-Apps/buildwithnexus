@@ -599,6 +599,7 @@ pub fn run() {
             }
         }
         "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
+        "audit" => std::process::exit(audit::cli(&args[1..])),
         "review" => {
             let req = match ReviewRequest::parse(&args[1..]) {
                 Ok(r) => r,
@@ -1648,6 +1649,7 @@ fn headless(
     let mut r = f(&provider, perm, cwd.clone());
     let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
+    audit::anchor();
     let blocked_calls = agent::blocked_without_terminal();
     let blocked = blocked_calls.len();
     if r.is_ok() && blocked > 0 {
@@ -1965,6 +1967,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     mcp::shutdown();
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
+    audit::anchor();
     if let Err(e) = result {
         eprintln!("{}", tui::red(&e));
     }
@@ -2579,6 +2582,7 @@ fn usage_text() -> String {
          \x20 buildwithnexus update [--check]   install the latest release (--check: exit 10 if behind)\n\
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
+         \x20 buildwithnexus audit head|path   a session's decision-log head (from the keyring) or file\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
          \x20 buildwithnexus system-prompt show|edit|suggest|reset|path\n\
          \x20                               the system prompt (--json on show)\n\

@@ -223,6 +223,245 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+// ── the anchor (roadmap 2.5, D3: the OS keyring and commit trailers) ──────
+//
+// The chain's head is written outside the log: to the OS keyring at the end
+// of each turn and of the session, and into a trailer on each commit bwn
+// makes. `bwn audit head` prints the keyring's copy for
+// `bwn-audit-verify --head`, which then also catches a log rewritten with a
+// consistent chain or cut short. Sandboxed commands can't reach the keyring
+// (on macOS the profile refuses the keychain daemon; on Linux the session
+// bus is out of their reach under the checker or with the network off). A
+// process outside the sandbox, running as the user, can; a pushed commit
+// trailer is the witness against that.
+
+const SERVICE: &str = "buildwithnexus-audit";
+/// No keyring call may hold bwn up longer than this.
+const KEYRING_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Where the head is anchored on this machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Keyring {
+    /// macOS: the login keychain, through `security`.
+    MacKeychain,
+    /// Linux: the Secret Service, through `secret-tool`.
+    SecretService,
+    /// A folder standing in for the keyring (debug builds: tests).
+    TestDir(PathBuf),
+}
+
+impl Keyring {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Keyring::MacKeychain => "the macOS keychain",
+            Keyring::SecretService => "the Secret Service keyring",
+            Keyring::TestDir(_) => "a test keyring",
+        }
+    }
+}
+
+/// The keyring this machine offers, if any. Never prompts.
+pub fn keyring() -> Option<Keyring> {
+    #[cfg(debug_assertions)]
+    if let Some(d) = std::env::var_os("BWN_TEST_KEYRING") {
+        return (!d.is_empty()).then(|| Keyring::TestDir(PathBuf::from(d)));
+    }
+    if cfg!(target_os = "macos") && crate::tools::find_on_path("security").is_some() {
+        return Some(Keyring::MacKeychain);
+    }
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+        && crate::tools::find_on_path("secret-tool").is_some()
+    {
+        return Some(Keyring::SecretService);
+    }
+    None
+}
+
+// Run a keyring tool with a hard limit, stdin optional. Some(stdout) on
+// success.
+fn run_limited(program: &str, args: &[&str], stdin: Option<&str>) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(text.as_bytes());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut o) = child.stdout.take() {
+                    let _ = std::io::Read::read_to_string(&mut o, &mut out);
+                }
+                return status.success().then_some(out);
+            }
+            Ok(None) if start.elapsed() < KEYRING_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn keyring_set(k: &Keyring, account: &str, value: &str) -> bool {
+    match k {
+        Keyring::MacKeychain => run_limited(
+            "security",
+            &[
+                "add-generic-password",
+                "-U",
+                "-s",
+                SERVICE,
+                "-a",
+                account,
+                "-w",
+                value,
+            ],
+            None,
+        )
+        .is_some(),
+        Keyring::SecretService => run_limited(
+            "secret-tool",
+            &[
+                "store",
+                "--label=bwn decision log head",
+                "service",
+                SERVICE,
+                "account",
+                account,
+            ],
+            Some(value),
+        )
+        .is_some(),
+        Keyring::TestDir(d) => {
+            std::fs::create_dir_all(d).is_ok()
+                && std::fs::write(d.join(format!("{account}.head")), value).is_ok()
+        }
+    }
+}
+
+fn keyring_get(k: &Keyring, account: &str) -> Option<String> {
+    let v = match k {
+        Keyring::MacKeychain => run_limited(
+            "security",
+            &["find-generic-password", "-s", SERVICE, "-a", account, "-w"],
+            None,
+        ),
+        Keyring::SecretService => run_limited(
+            "secret-tool",
+            &["lookup", "service", SERVICE, "account", account],
+            None,
+        ),
+        Keyring::TestDir(d) => std::fs::read_to_string(d.join(format!("{account}.head"))).ok(),
+    }?;
+    let v = v.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Write the chain's head to the keyring (turn end, session end). A failure
+/// says so once; it never stops the session.
+pub fn anchor() {
+    let Some((sid, head, seq)) = head() else {
+        return;
+    };
+    if seq == 0 {
+        return;
+    }
+    let Some(k) = keyring() else { return };
+    if !keyring_set(&k, &safe_id(&sid), &format!("{seq} {head}")) {
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "buildwithnexus: warning: could not write the decision log's head to {}",
+                k.label()
+            );
+        }
+    }
+}
+
+/// The head the keyring holds for a session: (number of decisions, head).
+pub fn anchored_head(sid: &str) -> Option<(u64, String)> {
+    let v = keyring_get(&keyring()?, &safe_id(sid))?;
+    let (n, h) = v.split_once(' ')?;
+    Some((n.parse().ok()?, h.to_string()))
+}
+
+/// The trailer a commit bwn makes carries, so pushed history witnesses the
+/// chain's head.
+pub fn commit_trailer() -> Option<String> {
+    let (sid, head, seq) = head()?;
+    (seq > 0).then(|| format!("Bwn-Decision-Log: {} {seq} {head}", safe_id(&sid)))
+}
+
+/// `bwn audit head [session]` and `bwn audit path [session]`.
+pub fn cli(args: &[String]) -> i32 {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sid = args
+        .get(1)
+        .cloned()
+        .or_else(latest_session)
+        .unwrap_or_default();
+    match sub {
+        "head" if !sid.is_empty() => match anchored_head(&sid) {
+            Some((n, h)) => {
+                println!("{h}");
+                eprintln!(
+                    "{n} decisions in session {sid}, anchored in {}",
+                    keyring().map(|k| k.label()).unwrap_or("?")
+                );
+                0
+            }
+            None => {
+                eprintln!(
+                    "no anchored head for session {sid} ({})",
+                    keyring().map_or("no keyring on this machine", |k| k.label())
+                );
+                1
+            }
+        },
+        "path" if !sid.is_empty() => {
+            println!("{}", path_for(&sid).display());
+            0
+        }
+        _ => {
+            eprintln!(
+                "usage: buildwithnexus audit head [session] | audit path [session]\n  then: bwn-audit-verify \"$(buildwithnexus audit path)\" --head \"$(buildwithnexus audit head)\""
+            );
+            2
+        }
+    }
+}
+
+// The most recently written session log's id.
+fn latest_session() -> Option<String> {
+    let dir = crate::config::home().join("audit");
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .and_then(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn forget_for_test() {
     *CHAIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
