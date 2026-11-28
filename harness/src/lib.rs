@@ -902,6 +902,13 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
     }
     tools::set_repo_map(opts.repo_map.unwrap_or(settings.repo_map));
+    agent::set_compaction(
+        settings
+            .compaction
+            .as_ref()
+            .and_then(|c| c.threshold_percent),
+        settings.compaction.as_ref().and_then(|c| c.keep_recent),
+    );
     commands::set_auto_commit(opts.auto_commit.unwrap_or(settings.auto_commit));
     let route = opts
         .route_gemini

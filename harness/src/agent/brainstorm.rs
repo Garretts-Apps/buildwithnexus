@@ -540,6 +540,21 @@ pub(super) fn chat_rounds(
             );
             trace_tool_call(&call.name, &call_input, "chat", tool_round);
 
+            // The question tool asks the person, as in the other loops;
+            // tools::run has no such tool.
+            if call.name == "question" || call.name == "AskUserQuestion" {
+                let (answer, is_error) = answer_question(&call_input);
+                report::tool_result(&call.name, &answer, is_error);
+                trace_tool_result(&call.name, &answer, is_error, "chat", tool_round);
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: answer,
+                    is_error,
+                    images: Vec::new(),
+                });
+                continue;
+            }
+
             let reason = hook_gate(perm, &call.name, &call_input, cwd).map(|r| match readonly {
                 Some(msg) => phase_readonly_reason(r, msg),
                 None => r,

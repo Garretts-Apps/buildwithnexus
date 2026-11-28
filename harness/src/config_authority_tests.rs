@@ -324,6 +324,12 @@ const KEYS: &[Key] = &[
         project: &[r#"["secrets","dependencies"]"#, "[]", "5"],
     },
     Key {
+        name: "compaction",
+        class: Class::Trust,
+        user: &[r#"{"threshold_percent":60,"keep_recent":10}"#, "{}", "5"],
+        project: &[r#"{"threshold_percent":20}"#, "5"],
+    },
+    Key {
         name: "sandbox_expose",
         class: Class::Trust,
         user: &[r#"["~/.npmrc"]"#, r#""x""#],

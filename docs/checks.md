@@ -23,6 +23,11 @@ rewrites the `package.json` script they run fails them. A project's `checks` run
 code, so like its hooks they wait until you trust the file; until then bwn
 runs the checks it detects.
 
+A check can be for some files only: `"paths": ["*.css", "web/*"]` runs it
+when a changed file's path or name matches one of the globs, so styles,
+scripts or templates each get their own checks. A check without `paths`
+runs for every change.
+
 A check can be read from a scanner's report instead of its exit status:
 `"format": "sarif"` (SARIF 2.1.0) or `"json"` (a list of findings), with
 `"fail_on"` the lowest SARIF level that fails (`error` by default) and
@@ -33,6 +38,12 @@ parses and holds no finding; a scanner that crashed fails.
 { "checks": [{ "name": "sast", "command": "semgrep scan --sarif --quiet", "format": "sarif", "kind": "security" }] }
 ```
 
-`"security_gates": ["secrets", "dependencies"]` adds two scanners every
-change must pass: gitleaks on every change, and osv-scanner when a manifest
-or lockfile changed. A gate whose scanner isn't installed blocks.
+`"security_gates"` adds scanners every change must pass, each read from its
+report: `"secrets"` (gitleaks, on every change), `"dependencies"`
+(osv-scanner, when a manifest or lockfile changed), `"sast"` (semgrep over
+the changed files, warnings and errors block), `"config"` (`trivy config`,
+when a Dockerfile, Terraform, Kubernetes or CI file changed) and `"sbom"`
+(syft regenerates `bom.json` as CycloneDX when a manifest or lockfile
+changed; the commit's evidence record names it). A
+gate whose scanner isn't installed blocks. semgrep's `--config auto`
+downloads its rules, so its host must be allowed in `network.allow`.

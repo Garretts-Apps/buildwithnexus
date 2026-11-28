@@ -9200,7 +9200,16 @@ struct Acp {
 
 impl Acp {
     fn start(home: &Path, cwd: &Path, args: &[&str]) -> Acp {
+        Acp::start_with(home, cwd, args, false)
+    }
+
+    // `ask_posture`: without the test-wide BWN_ACCEPT_POSTURE, so the
+    // startup check is asked in the editor.
+    fn start_with(home: &Path, cwd: &Path, args: &[&str], ask_posture: bool) -> Acp {
         let mut cmd = Command::new(BIN);
+        if ask_posture {
+            cmd.env_remove("BWN_ACCEPT_POSTURE");
+        }
         for var in NET_VARS {
             cmd.env_remove(var);
         }
@@ -12595,4 +12604,367 @@ if grep -qs vulnerable-pkg package.json; then echo '{"results":[{"packages":[{"p
     assert!(!cwd.join("OSV_RAN").exists());
     let (r, _) = run_gated(edit("cfg.txt", "x"), json!(["secrets"]), false, &none);
     assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+}
+
+// 3.6 (SD-1, second slice): seeded SAST and configuration findings block;
+// SAST reads the changed files; configuration scanning runs only when a
+// configuration file changed.
+#[cfg(unix)]
+#[test]
+fn invariant_sd1_sast_and_configuration_findings_block() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = tmp("stubs");
+    let stub = |name: &str, body: &str| {
+        let p = stubs.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let sarif = |rule: &str| {
+        format!(
+            r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"stub"}}}},"results":[{{"ruleId":"{rule}","level":"error","message":{{"text":"seeded"}}}}]}}]}}"#
+        )
+    };
+    let clean = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"stub"}},"results":[]}]}"#;
+    stub(
+        "semgrep",
+        &format!(
+            "found=0; for a in \"$@\"; do [ -f \"$a\" ] && grep -qs 'eval(' \"$a\" && found=1; done\nif [ $found = 1 ]; then echo '{}'; else echo '{clean}'; fi",
+            sarif("js-eval")
+        ),
+    );
+    stub(
+        "trivy",
+        &format!(
+            "touch TRIVY_RAN\nif grep -qs 'USER root' Dockerfile; then echo '{}'; else echo '{clean}'; fi",
+            sarif("DS002")
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_gated = |file: &str, content: &str, gates: Value| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "security_gates", gates);
+        let r = run_env(
+            &home,
+            &cwd,
+            &["--json", "run", "edit"],
+            &[("PATH", path.as_str())],
+        );
+        (r, cwd)
+    };
+    let (r, _) = run_gated("app.js", "run(eval(input))\n", json!(["sast"]));
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("js-eval"));
+    let (r, _) = run_gated("app.js", "run(input)\n", json!(["sast"]));
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    let (r, _) = run_gated("Dockerfile", "FROM alpine\nUSER root\n", json!(["config"]));
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    let (r, cwd) = run_gated("notes.txt", "n", json!(["config"]));
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(!cwd.join("TRIVY_RAN").exists());
+}
+
+// 3.7: with the `sbom` gate, a change to the dependencies regenerates the
+// SBOM through a real tool (a stub syft here); a missing tool blocks.
+#[cfg(unix)]
+#[test]
+fn the_sbom_is_regenerated_when_dependencies_change() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = tmp("stubs");
+    let p = stubs.join("syft");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nbom='{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"components\":[]}'\necho \"$bom\" > bom.json\necho \"$bom\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let go = |with_tool: bool| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call(
+                "w",
+                "write_file",
+                json!({"path": "requirements.txt", "content": "flask\n"}),
+            ),
+            finish("done"),
+            finish("done"),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "security_gates", json!(["sbom"]));
+        let env = [(
+            "PATH",
+            if with_tool {
+                path.as_str()
+            } else {
+                "/usr/bin:/bin"
+            },
+        )];
+        (run_env(&home, &cwd, &["--json", "run", "edit"], &env), cwd)
+    };
+    let (r, cwd) = go(true);
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(std::fs::read_to_string(cwd.join("bom.json"))
+        .unwrap()
+        .contains("CycloneDX"));
+    let (r, _) = go(false);
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+}
+
+// Roadmap 4.2 (CP-1): one table of gate decisions, the same answer through
+// `--json` and through ACP. An ask is a refusal for want of a terminal in
+// `--json`, and a session/request_permission in ACP (answered reject here);
+// an allow runs unasked in both; a deny is refused unasked in both. The
+// terminal goes through the same gate function as both.
+#[test]
+fn gate_decisions_are_the_same_in_json_and_acp() {
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum D {
+        Allow,
+        Ask,
+        Deny,
+    }
+    let cases: Vec<(&str, &str, Value, Value, D)> = vec![
+        (
+            "ask",
+            "read_file",
+            json!({"path": "a.txt"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "ask",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "ask",
+            "run_command",
+            json!({"command": "touch t.txt"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "ask",
+            "run_command",
+            json!({"command": "echo hi"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "auto",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Allow,
+        ),
+        (
+            "auto",
+            "run_command",
+            json!({"command": "rm -rf /"}),
+            json!({}),
+            D::Ask,
+        ),
+        (
+            "readonly",
+            "write_file",
+            json!({"path": "b.txt", "content": "x"}),
+            json!({}),
+            D::Deny,
+        ),
+        (
+            "auto",
+            "run_command",
+            json!({"command": "touch t.txt"}),
+            json!({"permissions": {"deny": ["run_command(touch *)"]}}),
+            D::Deny,
+        ),
+    ];
+    let settings = |home: &Path, extra: &Value| {
+        if let Some(m) = extra.as_object() {
+            for (k, v) in m {
+                add_user_setting(home, k, v.clone());
+            }
+        }
+    };
+    for (perm, tool, input, extra, want) in cases {
+        let label = format!("{perm} {tool} {input} {extra}");
+        // --json.
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(cwd.join("a.txt"), "a").unwrap();
+        let port = serve(vec![tool_call("c1", tool, input.clone()), finish("done")]);
+        write_config(&home, "ollama", perm, port);
+        settings(&home, &extra);
+        let r = run(&home, &cwd, "do it");
+        let denied = r.text_of("tool_denied");
+        let json_d = if denied.contains("no interactive terminal") {
+            D::Ask
+        } else if !denied.is_empty() {
+            D::Deny
+        } else {
+            D::Allow
+        };
+        assert_eq!(json_d, want, "--json {label}: {denied}");
+        // ACP.
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(cwd.join("a.txt"), "a").unwrap();
+        let (port, _) = serve_sse(vec![tool_call("c1", tool, input.clone()), text("done")]);
+        write_config(&home, "llamacpp", perm, port);
+        settings(&home, &extra);
+        let mut acp = Acp::start(&home, &cwd, &[]);
+        acp_init(&mut acp, json!({}));
+        let sid = acp_new_session(&mut acp, &cwd);
+        acp.call(
+            "session/prompt",
+            prompt(&sid, "do it"),
+            &mut choose("reject_once"),
+        );
+        let asked = !acp.agent_requests("session/request_permission").is_empty();
+        let completed = acp
+            .updates()
+            .iter()
+            .any(|u| u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed");
+        let acp_d = if asked {
+            D::Ask
+        } else if completed {
+            D::Allow
+        } else {
+            D::Deny
+        };
+        let _ = acp.close();
+        assert_eq!(acp_d, want, "ACP {label}");
+    }
+}
+
+// Roadmap 4.2: under ACP the model's question tool is answered in the
+// editor, as a choice between its options; the model gets the pick.
+#[test]
+fn acp_the_question_tool_is_answered_in_the_editor() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_sse(vec![
+        tool_call(
+            "q1",
+            "question",
+            json!({"question": "Which file?", "options": ["A.txt", "B.txt"]}),
+        ),
+        text("ok"),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+    // A window large enough that the question tool is offered.
+    add_user_setting(&home, "context_tokens", json!(200_000));
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let mut pick_second = |req: &Value| {
+        assert_eq!(req["method"], "session/request_permission", "{req}");
+        let opts = req["params"]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2, "{req}");
+        assert_eq!(opts[1]["name"], "B.txt");
+        json!({"outcome": {"outcome": "selected", "optionId": opts[1]["optionId"]}})
+    };
+    let done = acp.call("session/prompt", prompt(&sid, "ask me"), &mut pick_second);
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; {}",
+        acp.stderr()
+    );
+    let second = posts.lock().unwrap()[1].clone();
+    assert!(second.contains("The user answered: B.txt"), "{second}");
+    let _ = acp.close();
+}
+
+// Roadmap 4.2: under ACP the startup check is asked in the editor before
+// the first model request; accepted, the turn runs; refused, it doesn't
+// reach the model.
+#[test]
+fn acp_the_startup_check_is_answered_in_the_editor() {
+    for (answer, runs) in [("allow_once", true), ("reject_once", false)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let (port, posts) = serve_sse(vec![text("hello")]);
+        write_config(&home, "llamacpp", "ask", port);
+        let mut acp = Acp::start_with(&home, &cwd, &[], true);
+        acp_init(&mut acp, json!({}));
+        let sid = acp_new_session(&mut acp, &cwd);
+        let done = acp.call("session/prompt", prompt(&sid, "hi"), &mut choose(answer));
+        let asked = acp.agent_requests("session/request_permission");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.to_string().contains("accept this posture")),
+            "{answer}: {asked:?}; {done}"
+        );
+        assert_eq!(!posts.lock().unwrap().is_empty(), runs, "{answer}: {done}");
+        let _ = acp.close();
+    }
+}
+
+// Roadmap 4.3 (CP-2): checks for kinds of files, picked by the changed
+// paths. A seeded failure in each artifact type blocks; a change to a file
+// no check is for runs none of them.
+#[test]
+fn per_artifact_checks_run_for_their_files_and_block() {
+    if !npm_available() {
+        eprintln!("skipping: node not installed");
+        return;
+    }
+    let fails_if_bad = |file: &str| {
+        format!(
+            "node -e \"process.exit(require('fs').readFileSync('{file}','utf8').includes('bad')?1:0)\""
+        )
+    };
+    let checks = json!([
+        {"name": "styles", "command": fails_if_bad("style.css"), "paths": ["*.css"]},
+        {"name": "scripts", "command": fails_if_bad("app.js"), "paths": ["*.js"]},
+    ]);
+    let go = |file: &str, content: &str| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "checks", checks.clone());
+        run(&home, &cwd, "edit")
+    };
+    let r = go("style.css", "body { color: bad }");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("styles FAILED"));
+    assert!(!r.text_of("tool_result").contains("scripts"));
+    let r = go("app.js", "bad()");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("scripts FAILED"));
+    let r = go("README.md", "notes");
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(r
+        .text_of("tool_result")
+        .contains("no checks configured for the changed files"));
 }

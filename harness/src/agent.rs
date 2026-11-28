@@ -38,6 +38,7 @@ const MAX_VERIFIER_FIX_ROUNDS: usize = 2;
 const MAX_ACT_NUDGES: usize = 2;
 
 mod compact;
+pub use compact::set_compaction;
 use compact::*;
 
 mod prompt_layers;
@@ -652,6 +653,12 @@ pub enum RemoteAsk<'a> {
     Tool { label: &'a str, key: &'a str },
     /// Whether to build an approved plan.
     Plan { steps: &'a [String] },
+    /// The model's question tool (roadmap 4.2): the person picks one of
+    /// `options`.
+    Question {
+        question: &'a str,
+        options: &'a [String],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -662,6 +669,8 @@ pub enum RemoteAnswer {
     Reject,
     /// The turn was cancelled while the question was open.
     Cancelled,
+    /// The option picked for a `RemoteAsk::Question`, by index.
+    Chose(usize),
 }
 
 pub type RemoteApprover = Box<dyn Fn(RemoteAsk) -> RemoteAnswer + Send + Sync>;
@@ -678,6 +687,17 @@ pub(crate) fn has_remote_approver() -> bool {
     REMOTE_APPROVER.get().is_some()
 }
 
+/// The model's question, asked in the editor when bwn runs under ACP.
+/// None when there is no editor; Some(None) when it was cancelled or
+/// rejected; else the option picked.
+pub(crate) fn ask_remote_question(question: &str, options: &[String]) -> Option<Option<String>> {
+    let ask = REMOTE_APPROVER.get()?;
+    Some(match ask(RemoteAsk::Question { question, options }) {
+        RemoteAnswer::Chose(i) => options.get(i).cloned(),
+        _ => None,
+    })
+}
+
 /// The posture check's question, asked in the editor when bwn runs under
 /// ACP; None when there is no editor to ask.
 pub(crate) fn ask_remote_posture(posture: &str) -> Option<crate::posture::Answer> {
@@ -689,7 +709,9 @@ pub(crate) fn ask_remote_posture(posture: &str) -> Option<crate::posture::Answer
             key: "",
         }) {
             RemoteAnswer::Once | RemoteAnswer::Always => crate::posture::Answer::Accept,
-            RemoteAnswer::Reject | RemoteAnswer::Cancelled => crate::posture::Answer::Stop,
+            RemoteAnswer::Reject | RemoteAnswer::Cancelled | RemoteAnswer::Chose(_) => {
+                crate::posture::Answer::Stop
+            }
         },
     )
 }
@@ -704,7 +726,7 @@ fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<S
             crate::config::add_project_allowed(cwd, tool_key);
             None
         }
-        RemoteAnswer::Reject => Some("denied by user".into()),
+        RemoteAnswer::Reject | RemoteAnswer::Chose(_) => Some("denied by user".into()),
         RemoteAnswer::Cancelled => {
             stop_turn();
             Some(STOPPED_BY_USER.into())
@@ -944,14 +966,23 @@ pub fn sync_untrusted(sid: &str, msgs: &[Msg]) {
             return;
         }
         u.sid = sid.to_string();
-        u.tool = msgs.iter().find_map(|m| match m {
-            Msg::Tool(results) => results.iter().find_map(|r| {
-                let rest = r.content.split_once("[untrusted content from ")?.1;
-                rest.split_once(':').map(|(t, _)| t.to_string())
-            }),
-            _ => None,
-        });
+        u.tool = untrusted_tool_in(msgs);
     });
+}
+
+/// The tool through which `msgs` first show untrusted text: a labelled
+/// tool result, or the note a compaction left in its summary (roadmap 4.5),
+/// so the mark survives compaction and resume.
+pub(crate) fn untrusted_tool_in(msgs: &[Msg]) -> Option<String> {
+    let from = |text: &str| {
+        let rest = text.split_once("[untrusted content from ")?.1;
+        rest.split_once(':').map(|(t, _)| t.to_string())
+    };
+    msgs.iter().find_map(|m| match m {
+        Msg::Tool(results) => results.iter().find_map(|r| from(&r.content)),
+        Msg::User(text) | Msg::UserImages { text, .. } => from(text),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -2973,15 +3004,7 @@ fn build_turn(
                         None
                     }
                     None => Some(match &st.check_plan {
-                        Some(plan) => tools::run_check_plan(
-                            plan,
-                            cwd,
-                            st.changed_files.iter().any(|f| {
-                                std::path::Path::new(f)
-                                    .file_name()
-                                    .is_some_and(|n| tools::MANIFESTS.iter().any(|m| n == *m))
-                            }),
-                        ),
+                        Some(plan) => tools::run_check_plan(plan, cwd, &st.changed_files),
                         None => tools::run("check_work", &input, cwd),
                     }),
                 };

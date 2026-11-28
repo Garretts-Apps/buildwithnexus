@@ -238,6 +238,15 @@ impl std::fmt::Display for Effort {
     }
 }
 
+/// The `compaction` setting.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactionSettings {
+    #[serde(default)]
+    pub threshold_percent: Option<u8>,
+    #[serde(default)]
+    pub keep_recent: Option<usize>,
+}
+
 /// One entry of `checks`: a command, or a command with a name and a kind
 /// (`build`, `test`, `lint` or `security`, for `check_work`'s `only`;
 /// default `test`). A passing `security` check meets the verifier's
@@ -266,6 +275,11 @@ pub enum CheckSpec {
         /// output. Removed before the command runs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// The files this check is for (roadmap 4.3): it runs only when a
+        /// changed file matches one of these globs (`*.css`, `web/*`),
+        /// matched against its path or its name. Left out: every change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paths: Option<Vec<String>>,
     },
 }
 
@@ -289,6 +303,14 @@ impl CheckSpec {
 }
 
 impl CheckSpec {
+    /// The globs naming the files this check is for; empty for every change.
+    pub fn paths(&self) -> Vec<String> {
+        match self {
+            CheckSpec::Named { paths: Some(p), .. } => p.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The report a check produces: (format, fail_on, output file), when
     /// its result is read from a report rather than its exit status.
     pub fn report(&self) -> Option<(String, String, Option<String>)> {
@@ -467,6 +489,11 @@ pub struct Settings {
     /// installed blocks too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_gates: Vec<String>,
+    /// When the transcript is compacted and what stays verbatim (roadmap
+    /// 4.5): `threshold_percent` of the model's context (default 80) and
+    /// `keep_recent` messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionSettings>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -605,6 +632,7 @@ impl Default for Settings {
             shell_env_passthrough: Vec::new(),
             checks: None,
             security_gates: Vec::new(),
+            compaction: None,
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),
