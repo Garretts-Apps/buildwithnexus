@@ -7,6 +7,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **The `checks` setting names the checks that must pass (roadmap 3.1).**
+  It replaces detection; `[]` means none. A project file's `checks` run
+  code, so they wait for trust like its hooks, and the trust screen lists
+  each command. Until then a cloned repository's `["true"]` or `[]` doesn't
+  replace the checks bwn detects.
+- **A turn can't rewrite its own checks.** The checks are pinned when the
+  turn starts. Rewriting the `package.json` script they run (`"test":
+  "exit 0"`) or deleting the manifest fails them, and a `check_work` after
+  such a rewrite doesn't count. A check the `checks` setting names that
+  can't run fails, where a missing detected checker is still skipped.
+- **Changes are seen in every folder the session works in**, the whole git
+  work tree and added folders included, and outside git by change time as
+  well as size and modification time, so `touch -r` doesn't hide an edit.
+- **Failing checks read as failed everywhere.** The verifier's status is
+  `failed` (it said "passed with warnings"), and checks a rule or hook
+  refuses are listed among the run's denials.
 - **Verification sees every change, not just file-tool edits (roadmap 3.1;
   V1, V2, V5).** bwn snapshots the working tree at the start of a turn and
   compares it at finish, so an edit made with `sed` through `run_command`,

@@ -4368,10 +4368,123 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
 // One thing to run: a human label, a kind (build|test|lint|custom) so `only` can
 // filter, and the shell command itself.
+#[derive(Clone, Debug, PartialEq)]
 struct WorkCheck {
     label: String,
     kind: &'static str,
     cmd: String,
+}
+
+/// The checks a turn's changes must pass, pinned when the turn starts
+/// (roadmap 3.1): the `checks` setting, or what bwn detects. A detected
+/// npm check runs a `package.json` script, so the scripts' bodies are part
+/// of the plan: a turn that rewrites one (`"test": "exit 0"`) doesn't get
+/// to pass by it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckPlan {
+    checks: Vec<WorkCheck>,
+    configured: bool,
+    scripts: Vec<(String, Option<String>)>,
+}
+
+impl CheckPlan {
+    pub fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+    }
+}
+
+/// The checks for `cwd` now.
+pub fn check_plan(cwd: &Path) -> CheckPlan {
+    // Read live: the loader leaves out an untrusted project's `checks`, and
+    // a project trusted mid-session applies from its next check.
+    let configured = crate::config::load_settings_from_dir(cwd).and_then(|s| s.checks);
+    match configured {
+        Some(list) => CheckPlan {
+            checks: list
+                .iter()
+                .map(|c| c.parts())
+                .filter(|(_, _, cmd)| !cmd.trim().is_empty())
+                .map(|(label, kind, cmd)| WorkCheck {
+                    label,
+                    kind: match kind.as_str() {
+                        "build" => "build",
+                        "lint" => "lint",
+                        _ => "test",
+                    },
+                    cmd,
+                })
+                .collect(),
+            configured: true,
+            scripts: Vec::new(),
+        },
+        None => {
+            let checks = detect_checks(cwd);
+            let bodies = package_json_script_bodies(cwd);
+            let scripts = if cwd.join("package.json").exists() {
+                ["typecheck", "build", "test", "lint", "pretest", "posttest"]
+                    .iter()
+                    .map(|n| (n.to_string(), bodies.get(*n).cloned()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            CheckPlan {
+                checks,
+                configured: false,
+                scripts,
+            }
+        }
+    }
+}
+
+/// Run the plan pinned at the start of the turn. A detected plan whose
+/// scripts the turn rewrote fails: the checks would no longer be the ones
+/// the turn started with.
+pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path) -> Outcome {
+    if !pinned.configured {
+        let now = check_plan(cwd);
+        let changed: Vec<&str> = pinned
+            .scripts
+            .iter()
+            // A script the turn added is new work, not a changed check.
+            .filter(|(n, body)| {
+                body.is_some()
+                    && now.scripts.iter().find(|(m, _)| m == n).map(|(_, b)| b) != Some(body)
+            })
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if !changed.is_empty() {
+            return Outcome {
+                content: format!(
+                    "check_work: FAILED — package.json's {} script changed during this turn, so its \
+                     checks are not the ones the turn started with. Put the script back, or have a \
+                     person name the checks in the `checks` setting.",
+                    changed.join(", ")
+                ),
+                is_error: true,
+                finished: false,
+                images: Vec::new(),
+            };
+        }
+    }
+    if pinned.configured && pinned.checks.is_empty() {
+        return ok("check_work: no checks configured (the `checks` setting is empty).");
+    }
+    run_checks(&pinned.checks, cwd, pinned.configured)
+}
+
+fn package_json_script_bodies(cwd: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(cwd.join("package.json"))
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .and_then(|v| {
+            v.get("scripts").and_then(|s| s.as_object()).map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 // The platform shell for `cmd` in `cwd`, wrapped in the OS sandbox when the
@@ -4528,25 +4641,32 @@ fn check_tool_missing(output: &str, code: Option<i32>) -> bool {
 }
 
 fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
-    let checks = if let Some(cmd) = input["command"]
+    if let Some(cmd) = input["command"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        vec![WorkCheck {
+        let one = WorkCheck {
             label: cmd.to_string(),
             kind: "custom",
             cmd: cmd.to_string(),
-        }]
-    } else {
-        let only = input["only"].as_str().unwrap_or("").trim();
-        let mut checks = detect_checks(cwd);
-        if !only.is_empty() {
-            checks.retain(|c| c.kind == only);
-        }
-        checks
-    };
+        };
+        return run_checks(&[one], cwd, false);
+    }
+    let only = input["only"].as_str().unwrap_or("").trim();
+    let mut plan = check_plan(cwd);
+    if plan.configured && plan.checks.is_empty() {
+        return ok("check_work: no checks configured (the `checks` setting is empty).");
+    }
+    if !only.is_empty() {
+        plan.checks.retain(|c| c.kind == only);
+    }
+    run_checks(&plan.checks, cwd, plan.configured)
+}
 
+// Run `checks` and report. `required`: the checks a person named, so one
+// that can't run fails rather than counting as skipped.
+fn run_checks(checks: &[WorkCheck], cwd: &Path, required: bool) -> Outcome {
     if checks.is_empty() {
         return ok(
             "check_work: no build/test/lint commands detected for this project. \
@@ -4557,7 +4677,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
     let mut sections: Vec<String> = Vec::new();
     let mut any_fail = false;
     let mut ran = 0usize;
-    for c in &checks {
+    for c in checks {
         let cap = match shell_command(&c.cmd, cwd)
             .and_then(|command| run_with_timeout(command, None, CHECK_TIMEOUT))
         {
@@ -4577,7 +4697,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
                 CHECK_TIMEOUT.as_secs(),
                 c.cmd
             ));
-        } else if check_tool_missing(&combined, cap.code) {
+        } else if !required && check_tool_missing(&combined, cap.code) {
             sections.push(format!(
                 "– {} — skipped (checker not installed: `{}`)",
                 c.label, c.cmd

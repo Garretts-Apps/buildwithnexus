@@ -56,8 +56,51 @@ impl Snapshot {
     }
 }
 
-/// The working tree under `cwd` now.
+/// The files that differ between `before` and `now`, as paths: a git
+/// key (`XY:rel`) is under its work tree's top, a walk key under its root.
+pub fn changed_paths(before: &Snapshot, now: &Snapshot, cwd: &Path) -> Vec<std::path::PathBuf> {
+    now.changed_since(before)
+        .into_iter()
+        .map(|k| {
+            let (root, key) = match k.split_once('\u{0}') {
+                Some((r, key)) => (std::path::PathBuf::from(r), key.to_string()),
+                None => (cwd.to_path_buf(), k),
+            };
+            match crate::config::find_git_root(&root) {
+                // Git keys carry a two-letter status; walk keys don't.
+                Some(top) => top.join(key.get(3..).unwrap_or(&key)),
+                None => root.join(key),
+            }
+        })
+        .collect()
+}
+
+/// The working tree now: `cwd`'s (its whole git work tree when it is in
+/// one) and every folder added to the session, which commands may change
+/// too.
 pub fn take(cwd: &Path) -> Snapshot {
+    let mut all = BTreeMap::new();
+    let roots = std::iter::once(cwd.to_path_buf()).chain(crate::workdirs::list());
+    for (i, root) in roots.enumerate() {
+        match take_one(&root) {
+            Snapshot::Files(files) => {
+                for (k, v) in files {
+                    // The first root's keys stay as they are.
+                    let key = if i == 0 {
+                        k
+                    } else {
+                        format!("{}\u{0}{k}", root.display())
+                    };
+                    all.insert(key, v);
+                }
+            }
+            Snapshot::Unknown => return Snapshot::Unknown,
+        }
+    }
+    Snapshot::Files(all)
+}
+
+fn take_one(cwd: &Path) -> Snapshot {
     if crate::config::find_git_root(cwd).is_some() {
         git_snapshot(cwd).unwrap_or(Snapshot::Unknown)
     } else {
@@ -81,9 +124,9 @@ fn git_snapshot(cwd: &Path) -> Option<Snapshot> {
             "status",
             "--porcelain=v1",
             "-z",
+            // The whole work tree, not just under cwd: a command can
+            // edit a file above it.
             "--untracked-files=all",
-            "--",
-            ".",
         ])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -173,7 +216,16 @@ fn walk_snapshot(cwd: &Path) -> Snapshot {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_nanos());
-            files.insert(rel, format!("{}:{mtime}", m.len()));
+            // The change time too: `touch -r` can put a modification time
+            // back, but nothing a user runs can reset the change time.
+            #[cfg(unix)]
+            let ctime = {
+                use std::os::unix::fs::MetadataExt;
+                format!("{}.{}", m.ctime(), m.ctime_nsec())
+            };
+            #[cfg(not(unix))]
+            let ctime = "";
+            files.insert(rel, format!("{}:{mtime}:{ctime}", m.len()));
             if files.len() > MAX_FILES {
                 return Snapshot::Unknown;
             }
@@ -247,6 +299,23 @@ mod tests {
         std::fs::write(d.join("a.txt"), "22").unwrap();
         assert!(!take(&d).same_as(&base));
         assert!(!Snapshot::Unknown.same_as(&Snapshot::Unknown));
+        // A same-size edit with the modification time put back still shows.
+        #[cfg(unix)]
+        {
+            let before = take(&d);
+            let t = std::fs::metadata(d.join("a.txt"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            std::fs::write(d.join("a.txt"), "33").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(d.join("a.txt"))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+            assert!(!take(&d).same_as(&before));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
