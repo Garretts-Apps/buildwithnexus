@@ -394,6 +394,26 @@ def measure_npm_sizes(layout: Layout, spec: dict, prefix: Path, info: dict) -> d
         notes.append(
             "The npm package does not contain the native binary. First run downloads the GitHub release asset; that asset's byte size is included in download_bytes and the installed binary is included in install_bytes."
         )
+    # An archive the package's postinstall downloaded and left in its own
+    # folder (Crush: archive-*/crush_<v>_Linux_x86_64.tar.gz) is a download too.
+    own_dir = prefix / "lib" / "node_modules" / spec["package"]
+    fetched = sorted(
+        p
+        for p in own_dir.rglob("*")
+        if p.is_file()
+        and "node_modules" not in p.relative_to(own_dir).parts
+        and p.name.endswith((".tar.gz", ".tgz", ".zip"))
+        and p.stat().st_size > 1_000_000
+    ) if own_dir.exists() else []
+    for p in fetched:
+        download += p.stat().st_size
+        parts.append({"package": spec["package"], "file": p.name, "bytes": p.stat().st_size, "kind": "postinstall-download"})
+        if top is not None:
+            top = {**top, "bytes": top["bytes"] + p.stat().st_size}
+    if fetched:
+        notes.append(
+            "The package's postinstall downloads the native binary as an archive and leaves it in the package folder; its size is in download_bytes and package_bytes."
+        )
     entry = prefix / "bin" / spec["bins"][0]
     return {
         "package_bytes": None if top is None else top["bytes"],
