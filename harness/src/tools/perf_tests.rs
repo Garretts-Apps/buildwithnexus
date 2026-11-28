@@ -106,7 +106,8 @@ fn reference_grep(input: &Value, cwd: &Path) -> Outcome {
 
 fn assert_same_grep(dir: &Path, input: &Value) {
     let want = reference_grep(input, dir);
-    let got = run("grep_files", input, dir);
+    // The dispatcher: `run` adds source labels on top (roadmap 5.1).
+    let got = run_tool("grep_files", input, dir);
     assert_eq!(got.content, want.content, "input {input}");
     assert_eq!(got.is_error, want.is_error, "input {input}");
 }

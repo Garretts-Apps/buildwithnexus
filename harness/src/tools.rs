@@ -5843,18 +5843,28 @@ fn source_of(
             None
         }
         table::Tool::ReadFile | table::Tool::ReadManyFiles | table::Tool::GrepFiles => {
-            let mut paths = touched_paths(name, input, cwd);
-            if tool == table::Tool::GrepFiles {
-                // A search names the files it matched at the start of each
-                // line.
-                paths.extend(outcome.content.lines().filter_map(|l| {
-                    let f = l.split(':').next()?.trim();
-                    (!f.is_empty() && !f.contains(' ')).then(|| resolve(cwd, f))
-                }));
-            }
-            if paths
-                .iter()
-                .any(|p| is_dependency_path(p.strip_prefix(cwd).unwrap_or(p)))
+            let paths = touched_paths(name, input, cwd);
+            // A search names the files it matched at the start of each line;
+            // a match inside a dependency folder is a dependency's text. (A
+            // line's path is only looked at for that: whether the search ran
+            // outside the workspace is decided by where it was asked to look.)
+            let matched_dependency = tool == table::Tool::GrepFiles
+                && outcome.content.lines().any(|l| {
+                    let line = l.trim_start();
+                    DEPENDENCY_DIRS
+                        .iter()
+                        .map(|d| if *d == "go" { "go/pkg/mod" } else { d })
+                        .any(|d| {
+                            line.starts_with(&format!("{d}/"))
+                                || line.starts_with(&format!("{d}\\"))
+                                || line.contains(&format!("/{d}/"))
+                                || line.contains(&format!("\\{d}\\"))
+                        })
+                });
+            if matched_dependency
+                || paths
+                    .iter()
+                    .any(|p| is_dependency_path(p.strip_prefix(cwd).unwrap_or(p)))
             {
                 Some(Source::External(format!("{name} (a dependency's file)")))
             } else if paths.iter().any(|p| !in_workspace(p, cwd)) {
