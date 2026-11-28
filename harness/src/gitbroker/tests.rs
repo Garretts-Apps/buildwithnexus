@@ -212,6 +212,16 @@ fn remote_urls_name_their_host_and_only_https_and_ssh_pass() {
 #[cfg(unix)]
 #[test]
 fn invariant_au5_fetch_reaches_only_allowed_remote_hosts() {
+    // The host check reads the user's settings: a test elsewhere that points
+    // NEXUS_HOME at a broken settings file would make every host fail here.
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!("bwn-gb-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let prev_home = std::env::var_os("NEXUS_HOME");
+    std::env::set_var("NEXUS_HOME", &home);
     let d = repo("remote");
     let pinned = Pinned::find(std::slice::from_ref(&d));
     let verdict = |url: &str| {
@@ -244,4 +254,9 @@ fn invariant_au5_fetch_reaches_only_allowed_remote_hosts() {
     let plan = check(&args(&["fetch", "nope"]), &d, &pinned, &[]).unwrap();
     assert!(remote_check(&plan, Some("nope"), &d).is_err());
     let _ = std::fs::remove_dir_all(&d);
+    match prev_home {
+        Some(v) => std::env::set_var("NEXUS_HOME", v),
+        None => std::env::remove_var("NEXUS_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&home);
 }

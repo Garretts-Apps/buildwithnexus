@@ -739,6 +739,11 @@ jobs:
       - name: Test the longitudinal runner
         run: python3 -m unittest bench.longitudinal.test_runner
 
+      # The scripted model the cross-harness forbidden-action run drives
+      # every harness with (roadmap 6.3).
+      - name: Test the scripted model
+        run: python3 -m unittest bench.forbidden.test_scripted
+
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest

@@ -31,6 +31,9 @@ def log(msg: str) -> None:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     kw.setdefault("text", True)
+    # No tool waits on a terminal it was never given (codex exec reads stdin when it isn't one).
+    if "input" not in kw:
+        kw.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.run(cmd, **kw)
 
 
@@ -390,6 +393,26 @@ def measure_npm_sizes(layout: Layout, spec: dict, prefix: Path, info: dict) -> d
         )
         notes.append(
             "The npm package does not contain the native binary. First run downloads the GitHub release asset; that asset's byte size is included in download_bytes and the installed binary is included in install_bytes."
+        )
+    # An archive the package's postinstall downloaded and left in its own
+    # folder (Crush: archive-*/crush_<v>_Linux_x86_64.tar.gz) is a download too.
+    own_dir = prefix / "lib" / "node_modules" / spec["package"]
+    fetched = sorted(
+        p
+        for p in own_dir.rglob("*")
+        if p.is_file()
+        and "node_modules" not in p.relative_to(own_dir).parts
+        and p.name.endswith((".tar.gz", ".tgz", ".zip"))
+        and p.stat().st_size > 1_000_000
+    ) if own_dir.exists() else []
+    for p in fetched:
+        download += p.stat().st_size
+        parts.append({"package": spec["package"], "file": p.name, "bytes": p.stat().st_size, "kind": "postinstall-download"})
+        if top is not None:
+            top = {**top, "bytes": top["bytes"] + p.stat().st_size}
+    if fetched:
+        notes.append(
+            "The package's postinstall downloads the native binary as an archive and leaves it in the package folder; its size is in download_bytes and package_bytes."
         )
     entry = prefix / "bin" / spec["bins"][0]
     return {
@@ -1026,7 +1049,7 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
         cfg.write_text(
             json.dumps(
                 {
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-5.4-mini",
                     "provider": {
                         "openai": {
                             "options": {
@@ -1045,11 +1068,11 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
         env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
         return {
-            "argv": argv + ["run", "--pure", "--model", "openai/gpt-4o-mini", TASK_TEXT],
+            "argv": argv + ["run", "--pure", "--model", "openai/gpt-5.4-mini", TASK_TEXT],
             "env": env,
             "cwd": str(cwd),
             "methodology": methodology
-            + " OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock.",
+            + " OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock. The model is one from OpenCode's built-in catalog, which no longer lists gpt-4o-mini; the mock answers any model name.",
         }
     return {"ok": False, "status": "skipped", "reason": f"No mock invocation is defined for {cmd['id']}."}
 

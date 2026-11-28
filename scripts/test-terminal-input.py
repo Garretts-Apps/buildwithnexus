@@ -1547,13 +1547,17 @@ class HookEventTests(TerminalHarness):
                          "waiting for your input")
 
     def test_an_approval_notifies_and_compact_runs_pre_compact(self):
+        start = len(self.output)
         self.send("/build make the file\r")
         self.wait_for(lambda: self.events("notification_type", "permission_prompt"),
                       "permission_prompt notification")
         note = self.events("notification_type", "permission_prompt")[0]
         self.assertIn("approval needed", note["message"])
         self.assertIn("touch made.txt", note["message"])
-        self.wait_for(lambda: b"ASK" in self.output, "approval prompt")
+        # The answer keys, not "ASK": the status line names the permission
+        # mode with that word before the prompt is up, and a "y" sent then is
+        # queued as a message instead of answering.
+        self.wait_for(lambda: b"Y yes" in self.output[start:], "approval prompt")
         self.send("y\r")
         self.wait_for(lambda: (self.root / "made.txt").exists(), "approved command ran")
         self.wait_for(lambda: self.events("notification_type", "done"), "done notification")

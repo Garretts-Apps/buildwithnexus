@@ -64,6 +64,8 @@ def sh(cmd: list[str] | str, cwd: Path, timeout: int = 600, env: dict | None = N
         shell=isinstance(cmd, str),
         capture_output=True,
         text=True,
+        # A harness must not wait on a pipe it was never given (bwn waits 3 s for one).
+        stdin=subprocess.DEVNULL,
         timeout=timeout,
         env=env,
     )

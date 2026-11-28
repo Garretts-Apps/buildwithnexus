@@ -1,0 +1,201 @@
+{
+  "model": "baidu/ernie-5.5-flash-preview:free",
+  "upstream": "https://openrouter.ai/api/v1",
+  "task_text": "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.",
+  "time_utc": "2026-11-28T15-10-23Z",
+  "tools": {
+    "bwn-native": {
+      "display": "bwn native",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 1.568,
+      "model_requests": 1,
+      "request_bytes": 17113,
+      "prompt_tokens": 4413,
+      "completion_tokens": 6,
+      "requests_without_usage": 0,
+      "upstream_statuses": [
+        200
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "stdout_tail": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:39395) \u00b7 bench\n  cwd    /home/user/buildwithnexus/bench/.tools/live-work/bwn-native\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 1.56s\n",
+      "stderr_tail": "",
+      "refused_requests": 0
+    },
+    "bwn-npm": {
+      "display": "bwn (npm)",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 1.939,
+      "model_requests": 1,
+      "request_bytes": 17110,
+      "prompt_tokens": 4414,
+      "completion_tokens": 6,
+      "requests_without_usage": 0,
+      "upstream_statuses": [
+        200
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "stdout_tail": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:39395) \u00b7 bench\n  cwd    /home/user/buildwithnexus/bench/.tools/live-work/bwn-npm\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 1.83s\n",
+      "stderr_tail": "",
+      "retried": true,
+      "refused_requests": 0
+    },
+    "claude": {
+      "display": "Claude Code",
+      "status": "skipped",
+      "reason": "Claude Code speaks the Anthropic Messages API (ANTHROPIC_BASE_URL). It cannot be pointed at an OpenAI-compatible chat or responses endpoint, so it is not given a fake time."
+    },
+    "codex": {
+      "display": "Codex CLI",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 3.448,
+      "model_requests": 1,
+      "refused_requests": 0,
+      "request_bytes": 39850,
+      "prompt_tokens": 8644,
+      "completion_tokens": 6,
+      "requests_without_usage": 0,
+      "upstream_statuses": [
+        200
+      ],
+      "paths": [
+        "/v1/responses"
+      ],
+      "stdout_tail": "BENCHMARK_OK\n",
+      "stderr_tail": "Reading additional input from stdin...\nOpenAI Codex v0.169.0\n--------\nworkdir: /home/user/buildwithnexus/bench/.tools/live-work/codex\nmodel: bench\nprovider: bench\napproval: never\nsandbox: danger-full-access\nreasoning effort: none\nreasoning summaries: none\nsession id: 01a222b9-d3c0-7eb1-9f81-d645f24b4f61\n--------\nuser\nReply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.\nwarning: Model metadata for `bench` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.\ncodex\nBENCHMARK_OK\ntokens used\n202\n"
+    },
+    "gemini": {
+      "display": "Gemini CLI",
+      "status": "skipped",
+      "reason": "Gemini CLI's GOOGLE_GEMINI_BASE_URL is the Gemini API base (generateContent), not an OpenAI-compatible chat or responses URL. It is not given a fake time."
+    },
+    "opencode": {
+      "display": "OpenCode",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 11.643,
+      "model_requests": 2,
+      "refused_requests": 4,
+      "request_bytes": 32304,
+      "prompt_tokens": 7181,
+      "completion_tokens": 11,
+      "requests_without_usage": 4,
+      "upstream_statuses": [
+        429,
+        429,
+        429,
+        429,
+        200,
+        200
+      ],
+      "paths": [
+        "/v1/responses"
+      ],
+      "stdout_tail": "BENCHMARK_OK\n",
+      "stderr_tail": "\u001b[0m\n> build \u00b7 gpt-5.4-mini\n\u001b[0m\n"
+    },
+    "aider": {
+      "display": "Aider",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 24.656,
+      "model_requests": 1,
+      "request_bytes": 53584,
+      "prompt_tokens": 717,
+      "completion_tokens": 34,
+      "requests_without_usage": 15,
+      "upstream_statuses": [
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        429,
+        200
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "stdout_tail": "Error: OpenAIException - Provider returned \nerror\nThe API provider has rate limited you. Try again later or check your quotas.\nRetrying in 2.0 seconds...\nlitellm.RateLimitError: RateLimitError: OpenAIException - Provider returned \nerror\nThe API provider has rate limited you. Try again later or check your quotas.\nRetrying in 4.0 seconds...\n\n--------------\n\u25ba **THINKING**\n\nThe user wants exactly \"BENCHMARK_OK\" and nothing else. No tools, no edits, no \ncommands. Just reply with that.\n\n------------\n\u25ba **ANSWER**\n\nBENCHMARK_OK\n\nTokens: 717 sent, 34 received. Cost: $0.00013 message, $0.00013 session.\n",
+      "stderr_tail": "Warning: Input is not a terminal (fd=0).\n",
+      "refused_requests": 15,
+      "request_bytes_include_refused": true
+    },
+    "copilot": {
+      "display": "Copilot CLI",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 2.178,
+      "model_requests": 1,
+      "request_bytes": 60000,
+      "prompt_tokens": 13483,
+      "completion_tokens": 6,
+      "requests_without_usage": 0,
+      "upstream_statuses": [
+        200
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "stdout_tail": "BENCHMARK_OK\n\n",
+      "stderr_tail": "\n\nChanges    +0 -0\nDuration   1s\nTokens     \u2191 13.5k \u2022 \u2193 6\nResume     copilot --resume=acd62abf-d594-43da-b33b-b17c8e3f665d\n",
+      "refused_requests": 0
+    },
+    "crush": {
+      "display": "Crush",
+      "status": "measured",
+      "ok": true,
+      "outcome": "ok",
+      "exit_code": 0,
+      "wall_s": 44.5,
+      "model_requests": 4,
+      "request_bytes": 74607,
+      "prompt_tokens": 15609,
+      "completion_tokens": 1154,
+      "requests_without_usage": 3,
+      "upstream_statuses": [
+        200,
+        200,
+        200,
+        429,
+        429,
+        429,
+        200
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "stdout_tail": "BENCHMARK_OK\n",
+      "stderr_tail": "",
+      "refused_requests": 3,
+      "request_bytes_include_refused": true
+    }
+  }
+}
