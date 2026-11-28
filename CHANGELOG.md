@@ -19,6 +19,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Cloud background agents (roadmap 4.6).** `buildwithnexus bg cloud init`
+  writes a workflow that runs bwn's GitHub Action, and
+  `buildwithnexus bg run --cloud <task>` dispatches it on your pushed
+  commit.
+  - **On the runner:** bwn works on a `bwn/cloud-...` branch in auto mode,
+    committing only what passes its checks. It pushes the branch and its
+    evidence records.
+  - **Bringing it back:** `buildwithnexus bg fetch <branch>` fetches both,
+    keeping a record only when its content hashes to its name.
+  - **Merging:** `bg merge` merges only when every commit verifies against
+    its record, as for a local agent.
+  - **Only your own runs:** `bg fetch` takes only a branch this bwn home
+    dispatched, starting from the commit it was dispatched on.
+  - **Credentials:** the checkout keeps none while the agent runs; only the
+    publish step gets the job's token.
+  - **What the hash check proves:** it proves integrity, not who made the
+    record. Anyone with push access could replace a dispatched run's
+    branch and records before you fetch them.
+  - **Setup:** see `docs/cloud-agents.md`.
 - **A browser with your signed-in session (roadmap 5.9).**
   `"signed_in_browser": {"profile": ..., "hosts": [...]}` adds a tool that
   reads pages on those hosts as you. It runs from a copy of the profile,

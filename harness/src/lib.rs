@@ -503,6 +503,7 @@ pub fn run() {
     // `init --agents-md` is init's one option; any other is still a mistake.
     let command_flags: &[&str] = match cmd {
         "init" | "da-init" | "setup" => &["--agents-md"],
+        "bg" => &["--cloud", "--force"],
         _ => &[],
     };
     let unknown = opts

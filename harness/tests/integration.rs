@@ -13524,6 +13524,299 @@ fn invariant_cp4_background_work_merges_only_with_evidence() {
     assert!(!cwd.join("manual.txt").exists());
 }
 
+// Roadmap 4.6 (cloud delegation): a cloud agent's branch comes back with
+// the records its commits name, each kept only when its content hashes to
+// its name, and merges only once they are here. A runner clone stands in
+// for the GitHub Actions job and a bare repository for GitHub.
+#[cfg(unix)]
+#[test]
+fn a_cloud_agents_branch_merges_only_with_its_fetched_evidence() {
+    let origin = tmp("cloud-origin");
+    let user = tmp("cloud-user");
+    let runner = tmp("cloud-runner");
+    let uhome = tmp("cloud-uhome");
+    let rhome = tmp("cloud-rhome");
+    let g = |dir: &Path, args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let bwn = |dir: &Path, home: &Path, args: &[&str]| {
+        let o = Command::new(BIN)
+            .args(args)
+            .current_dir(dir)
+            .env("NEXUS_HOME", home)
+            .env(
+                "PATH",
+                format!("{}:{}", home.display(), std::env::var("PATH").unwrap()),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    g(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    for d in [&user, &runner] {
+        g(d, &["init", "-q", "-b", "main"]);
+        g(d, &["config", "user.name", "t"]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    }
+    std::fs::write(user.join(".gitignore"), ".bwn/\n").unwrap();
+    std::fs::write(user.join("base.txt"), "b").unwrap();
+    g(&user, &["add", "."]);
+    g(&user, &["commit", "-q", "-m", "base"]);
+
+    // A fake gh records what it was asked to run.
+    let gh = uhome.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}/gh-args\n",
+            uhome.display()
+        ),
+    )
+    .unwrap();
+    std::os::unix::fs::PermissionsExt::set_mode(
+        &mut std::fs::metadata(&gh).unwrap().permissions(),
+        0o755,
+    );
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    // Dispatch refuses a commit origin doesn't have, and a missing workflow.
+    let (code, said) = bwn(&user, &uhome, &["bg", "run", "--cloud", "add a file"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("push it first"), "{said}");
+    g(&user, &["push", "-q", "origin", "main"]);
+    g(&user, &["fetch", "-q", "origin"]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "run", "--cloud", "add a file"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("bg cloud init"), "{said}");
+    let (code, said) = bwn(&user, &uhome, &["bg", "cloud", "init"]);
+    assert_eq!(code, Some(0), "{said}");
+    g(&user, &["add", ".github"]);
+    g(&user, &["commit", "-q", "-m", "cloud workflow"]);
+    g(&user, &["push", "-q", "origin", "main"]);
+    g(&user, &["fetch", "-q", "origin"]);
+    let task = "add a file; $(touch pwned)";
+    let (code, said) = bwn(&user, &uhome, &["bg", "run", "--cloud", task]);
+    assert_eq!(code, Some(0), "{said}");
+    let args = std::fs::read_to_string(uhome.join("gh-args")).unwrap();
+    assert!(args.lines().any(|l| l == format!("task={task}")), "{args}");
+    assert!(!user.join("pwned").exists());
+    let branch = args
+        .lines()
+        .find_map(|l| l.strip_prefix("branch="))
+        .unwrap()
+        .to_string();
+    let base = args
+        .lines()
+        .find_map(|l| l.strip_prefix("base="))
+        .unwrap()
+        .to_string();
+
+    // The runner: the workflow's steps, with a scripted model.
+    g(&runner, &["fetch", "-q", "origin"]);
+    g(&runner, &["checkout", "-q", &base]);
+    g(&runner, &["switch", "-q", "-c", &branch]);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "new.txt", "content": "from the cloud\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        rhome.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (code, said) = bwn(
+        &runner,
+        &rhome,
+        &[
+            "--json",
+            "--accept-posture",
+            "--auto-commit",
+            "run",
+            "add a file",
+        ],
+    );
+    assert_eq!(code, Some(0), "{said}");
+    let (code, said) = bwn(&runner, &rhome, &["bg", "publish", &branch]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("1 evidence record"), "{said}");
+
+    // Back here: without its evidence the branch doesn't merge.
+    g(
+        &user,
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            &format!("+refs/heads/{branch}:refs/heads/{branch}"),
+        ],
+    );
+    let (code, refused) = bwn(&user, &uhome, &["bg", "merge", &branch]);
+    assert_eq!(code, Some(1), "{refused}");
+    assert!(refused.contains("don't verify"), "{refused}");
+
+    // A forged record on the evidence branch is refused; the real one kept.
+    let ev = format!("refs/heads/bwn-evidence/{branch}");
+    g(
+        &runner,
+        &["fetch", "-q", "origin", &format!("+{ev}:refs/ev")],
+    );
+    let forged_name = "0".repeat(64);
+    let blob = {
+        let mut c = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(&runner)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        c.stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"version":1,"files":[]}"#)
+            .unwrap();
+        String::from_utf8(c.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    g(&runner, &["read-tree", "refs/ev"]);
+    g(
+        &runner,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{forged_name}.json"),
+        ],
+    );
+    let tree = g(&runner, &["write-tree"]).trim().to_string();
+    let c = g(
+        &runner,
+        &["commit-tree", &tree, "-p", "refs/ev", "-m", "forged"],
+    )
+    .trim()
+    .to_string();
+    g(
+        &runner,
+        &["push", "-q", "--force", "origin", &format!("{c}:{ev}")],
+    );
+    g(&runner, &["read-tree", "HEAD"]);
+
+    let (code, said) = bwn(&user, &uhome, &["bg", "fetch", &branch]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("kept 1 evidence record"), "{said}");
+    assert!(
+        said.contains("refused 1") && said.contains("doesn't hash to its name"),
+        "{said}"
+    );
+    assert!(!uhome
+        .join("evidence")
+        .join(format!("{forged_name}.json"))
+        .exists());
+
+    let (code, merged) = bwn(&user, &uhome, &["bg", "merge", &branch]);
+    assert_eq!(code, Some(0), "{merged}");
+    assert!(
+        merged.contains("verified against its evidence record"),
+        "{merged}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(user.join("new.txt")).unwrap(),
+        "from the cloud\n"
+    );
+    // A branch anyone with push access made under the cloud prefix, with a
+    // commit and a record that match each other, isn't fetched: this home
+    // didn't dispatch it.
+    let run_on = |b: &str, from: &[&str]| {
+        g(&runner, from);
+        g(&runner, &["switch", "-q", "-c", b]);
+        let port = serve(vec![
+            tool_call(
+                "c1",
+                "write_file",
+                json!({"path": "evil.txt", "content": "x\n"}),
+            ),
+            finish("done"),
+            finish("done"),
+        ]);
+        std::fs::write(
+            rhome.join("config.json"),
+            json!({
+                "provider": "ollama", "model": "test-model", "permission": "auto",
+                "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (code, said) = bwn(
+            &runner,
+            &rhome,
+            &["--json", "--accept-posture", "--auto-commit", "run", "x"],
+        );
+        assert_eq!(code, Some(0), "{said}");
+        let (code, said) = bwn(&runner, &rhome, &["bg", "publish", b]);
+        assert_eq!(code, Some(0), "{said}");
+    };
+    run_on("bwn/cloud-unasked", &["checkout", "-q", &base]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "fetch", "bwn/cloud-unasked"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("wasn't dispatched from here"), "{said}");
+    let (code, _) = bwn(&user, &uhome, &["bg", "merge", "bwn/cloud-unasked"]);
+    assert_eq!(code, Some(1));
+
+    // A dispatched branch whose history doesn't start from its base isn't kept.
+    g(&user, &["push", "-q", "origin", "main"]);
+    g(&user, &["fetch", "-q", "origin"]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "run", "--cloud", "another task"]);
+    assert_eq!(code, Some(0), "{said}");
+    let args = std::fs::read_to_string(uhome.join("gh-args")).unwrap();
+    let branch2 = args
+        .lines()
+        .find_map(|l| l.strip_prefix("branch="))
+        .unwrap()
+        .to_string();
+    g(&runner, &["checkout", "-q", "--orphan", "unrelated"]);
+    g(
+        &runner,
+        &["commit", "-q", "--allow-empty", "-m", "an unrelated root"],
+    );
+    run_on(&branch2, &["checkout", "-q", "unrelated"]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "fetch", &branch2]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("doesn't start from"), "{said}");
+    let (code, _) = bwn(&user, &uhome, &["bg", "merge", &branch2]);
+    assert_eq!(code, Some(1));
+}
+
 // Roadmap 5.8 (SD-8): an experiment runs a task as several background
 // agents, each in a worktree of its own, scores each by the verification
 // engine, and keeps the comparison as an evidence record; merging a variant

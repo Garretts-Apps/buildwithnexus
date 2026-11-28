@@ -108,6 +108,35 @@ pub fn store(rec: &Value) -> Option<String> {
     Some(hash)
 }
 
+/// Keep a record made elsewhere (a cloud agent's, roadmap 4.6) under its
+/// hash, only when its bytes hash to the name it came with. A record is
+/// content-addressed, so this can neither replace one already here nor add
+/// one that a commit's trailer would name falsely.
+pub fn import(hash: &str, bytes: &[u8]) -> Result<(), String> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("`{hash}` isn't a record's hash"));
+    }
+    if sha256_hex(bytes) != hash.to_ascii_lowercase() {
+        return Err(format!("{hash}: its content doesn't hash to its name"));
+    }
+    serde_json::from_slice::<Value>(bytes).map_err(|e| format!("{hash}: not JSON: {e}"))?;
+    crate::config::ensure_home();
+    std::fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir().join(format!("{}.json", hash.to_ascii_lowercase())),
+        bytes,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A record's bytes as kept, when its name is a hash and it is here.
+pub fn raw(hash: &str) -> Option<Vec<u8>> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    std::fs::read(dir().join(format!("{hash}.json"))).ok()
+}
+
 // A record by its hash, checked against it.
 fn load(hash: &str) -> Result<Value, String> {
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
