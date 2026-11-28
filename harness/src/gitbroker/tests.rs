@@ -131,6 +131,8 @@ fn invariant_au5_a_repository_made_later_or_above_is_not_served() {
 
 // Even a served repository's own config can't run a pager, an external
 // diff or a hook through the broker: they are set off on the command line.
+// The broker runs on Unix only (no shim on Windows).
+#[cfg(unix)]
 #[test]
 fn invariant_au5_the_brokered_git_runs_no_pager_diff_program_or_hook() {
     let d = repo("hard");
@@ -206,6 +208,8 @@ fn remote_urls_name_their_host_and_only_https_and_ssh_pass() {
 
 // Fetch and pull reach only a remote the repository names, over HTTPS or
 // SSH, to a host the network rules allow; a path or local remote doesn't.
+// The broker runs on Unix only (no shim on Windows).
+#[cfg(unix)]
 #[test]
 fn invariant_au5_fetch_reaches_only_allowed_remote_hosts() {
     let d = repo("remote");
