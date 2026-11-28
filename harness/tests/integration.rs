@@ -1464,6 +1464,7 @@ fn finish_without_check_work_runs_it_and_feeds_failures_back_once() {
         ),
         finish("first attempt"),
         finish("second attempt"),
+        finish("third attempt"),
     ]);
     write_config(&home, "ollama", "auto", port);
 
@@ -1477,13 +1478,16 @@ fn finish_without_check_work_runs_it_and_feeds_failures_back_once() {
         .collect();
     assert_eq!(
         checks.len(),
-        1,
-        "check_work runs automatically exactly once"
+        2,
+        "the project's checks run at most twice a turn"
     );
     let finishes = r.events.iter().filter(|e| e["type"] == "finish").count();
-    assert_eq!(finishes, 2, "one extra round after the failing report");
+    assert_eq!(finishes, 3, "two extra rounds after the failing reports");
     let notices = r.text_of("notice");
-    assert!(notices.contains("without check_work"), "{notices}");
+    assert!(
+        notices.contains("running the project's checks"),
+        "{notices}"
+    );
     assert!(notices.contains("check_work failed"), "{notices}");
     // The verifier also runs headlessly and reports the failed checks.
     let verify = r.find("verify").expect("verify event in --json mode");
@@ -1543,7 +1547,8 @@ fn check_work_enforcement_skips_when_no_project_and_when_model_ran_it() {
     assert!(!r.text_of("notice").contains("check_work failed"));
     assert!(r.has_event("verify"));
 
-    // The model ran check_work itself: the harness never adds a second one.
+    // The model ran check_work with its own command: that is advisory, so
+    // the harness still runs the project's checks (none here, which is fine).
     let cwd2 = tmp("proj");
     let port = serve(vec![
         tool_call(
@@ -1562,8 +1567,8 @@ fn check_work_enforcement_skips_when_no_project_and_when_model_ran_it() {
         .iter()
         .filter(|e| e["type"] == "tool_call" && e["name"] == "check_work")
         .count();
-    assert_eq!(checks, 1);
-    assert!(!r.text_of("notice").contains("without check_work"));
+    assert_eq!(checks, 2);
+    assert!(!r.text_of("notice").contains("check_work failed"));
 }
 
 #[test]
@@ -11690,4 +11695,193 @@ fn invariant_in1_a_command_cannot_change_a_project_policy_file() {
         &env,
     );
     assert_eq!(std::fs::read_to_string(&policy).unwrap(), "{}");
+}
+
+// ── VE: verification sees every change (roadmap 3.1) ────────────────────────
+
+// A project whose checks pass only while state.txt says "good".
+fn ve_project() -> Option<(PathBuf, PathBuf)> {
+    if !npm_available() {
+        eprintln!("skipping: npm not installed");
+        return None;
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"p","version":"1.0.0","scripts":{"test":"node -e \"process.exit(require('fs').readFileSync('state.txt','utf8').includes('good')?0:1)\""}}"#,
+    )
+    .unwrap();
+    std::fs::write(cwd.join("state.txt"), "good\n").unwrap();
+    Some((home, cwd))
+}
+
+fn check_work_calls(r: &Run) -> usize {
+    r.events
+        .iter()
+        .filter(|e| e["type"] == "tool_call" && e["name"] == "check_work")
+        .count()
+}
+
+// VE-1: a check_work with the model's own passing command does not stand in
+// for the project's checks; the bad edit still fails the run.
+#[test]
+fn invariant_ve1_the_models_own_check_command_does_not_satisfy_the_checks() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(vec![
+        tool_call("c0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "state.txt", "content": "bad\n"}),
+        ),
+        tool_call("c2", "check_work", json!({"command": "true"})),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "break it");
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+    assert_eq!(
+        check_work_calls(&r),
+        3,
+        "one advisory, two of the project's"
+    );
+}
+
+// VE-2: an edit made through run_command counts as a change, in a plain
+// folder and in a git work tree. Unix: Windows has no sandbox backend, so
+// every command asks and, with no terminal, is refused.
+#[cfg(unix)]
+#[test]
+fn invariant_ve2_an_edit_through_run_command_is_checked() {
+    for git in [false, true] {
+        let Some((home, cwd)) = ve_project() else {
+            return;
+        };
+        if git {
+            for args in [
+                &["init", "-q"][..],
+                &["add", "."],
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "base",
+                ],
+            ] {
+                assert!(Command::new("git")
+                    .args(args)
+                    .current_dir(&cwd)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        }
+        let port = serve(vec![
+            tool_call(
+                "c1",
+                "run_command",
+                json!({"command": "printf 'bad\\n' > state.txt"}),
+            ),
+            finish("done"),
+            finish("done"),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "break it");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("state.txt")).unwrap(),
+            "bad\n",
+            "git={git}: the command ran"
+        );
+        assert_eq!(r.code, Some(7), "git={git} stderr: {}", r.stderr);
+        assert_eq!(check_work_calls(&r), 2, "git={git}");
+    }
+}
+
+// VE-3: finishing again and again over failing checks never ends in
+// success; fixing the change does.
+#[test]
+fn invariant_ve3_repeated_finish_over_failing_checks_is_a_failure() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(vec![
+        tool_call("c0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "state.txt", "content": "bad\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "break it");
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+    assert!(check_work_calls(&r) <= 2);
+
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(vec![
+        tool_call("c0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "state.txt", "content": "bad\n"}),
+        ),
+        finish("done"),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "state.txt", "content": "good\n"}),
+        ),
+        finish("fixed"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "break it, then fix it");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(check_work_calls(&r), 2);
+}
+
+// VE-5: a helper's bad edit is the parent's change: the parent's finish
+// runs the project's checks and the run fails.
+#[test]
+fn invariant_ve5_a_helpers_edit_is_checked_at_the_parents_finish() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(vec![
+        tool_call("c1", "spawn_subagent", json!({"task": "edit state"})),
+        tool_call("s0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "s1",
+            "write_file",
+            json!({"path": "state.txt", "content": "bad\n"}),
+        ),
+        finish("helper done"),
+        finish("parent done"),
+        finish("parent done"),
+        finish("parent done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "delegate");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("state.txt")).unwrap(),
+        "bad\n",
+        "the helper wrote in place"
+    );
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+    assert_eq!(check_work_calls(&r), 2);
 }

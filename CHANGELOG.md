@@ -7,6 +7,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Verification sees every change, not just file-tool edits (roadmap 3.1;
+  V1, V2, V5).** bwn snapshots the working tree at the start of a turn and
+  compares it at finish, so an edit made with `sed` through `run_command`,
+  a deletion, or a helper's edit now triggers the project's checks. They
+  run whenever the tree changed since they last passed, and a passing
+  `check_work` with the model's own `command` (say `true`) no longer
+  satisfies them: it is advisory. Failing checks get the model up to two
+  more rounds, then the run exits 7. Outside git, bwn compares file sizes
+  and times; in a folder too large to snapshot (over 20,000 files) the
+  checks run at every finish.
 - **Landlock alone: a credential store under a temp folder is no longer
   claimed hidden.** Landlock can't carve a store out of a folder commands
   may write. bwn checked that only for the workspace, not for `/tmp` or

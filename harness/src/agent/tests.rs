@@ -1519,26 +1519,23 @@ fn hook_allow_cannot_bypass_readonly_gate() {
 }
 
 #[test]
-fn auto_check_work_only_when_files_changed_at_top_level_once() {
-    // Baseline: depth 0, a file changed, model skipped check_work, first time.
-    assert!(should_auto_check_work(Permission::Auto, 0, 1, false, 0));
-    assert!(should_auto_check_work(Permission::Ask, 0, 3, false, 0));
-    // Subagents never trigger it (the parent will).
-    assert!(!should_auto_check_work(Permission::Auto, 1, 1, false, 0));
-    // Nothing written: nothing to check.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 0, false, 0));
-    // The model already checked its work.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 1, true, 0));
-    // Read-only turns can't have changed files, and never run checks.
+fn auto_check_work_runs_for_an_uncovered_change_at_top_level() {
+    // A change no pass of the project's checks covers, at depth 0.
+    assert!(should_auto_check_work(Permission::Auto, 0, true, 0));
+    assert!(should_auto_check_work(Permission::Ask, 0, true, 1));
+    // Subagents never trigger it (the parent checks the whole tree).
+    assert!(!should_auto_check_work(Permission::Auto, 1, true, 0));
+    // Nothing changed, or a pass covers the tree as it is.
+    assert!(!should_auto_check_work(Permission::Auto, 0, false, 0));
+    // Read-only turns never run checks.
+    assert!(!should_auto_check_work(Permission::ReadOnly, 0, true, 0));
+    // Bounded: after MAX_AUTO_CHECK_ROUNDS a failing run ends as a failure.
     assert!(!should_auto_check_work(
-        Permission::ReadOnly,
+        Permission::Auto,
         0,
-        1,
-        false,
-        0
+        true,
+        MAX_AUTO_CHECK_ROUNDS
     ));
-    // At most one automatic round per turn.
-    assert!(!should_auto_check_work(Permission::Auto, 0, 1, false, 1));
 }
 
 #[test]
@@ -2327,7 +2324,20 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
     std::env::set_var("NEXUS_HOME", &home);
-    let old_cwd = std::env::current_dir().unwrap();
+    // Other tests set the process-wide sandbox mode; on a machine with no
+    // backend (Windows) that would put this thread in restricted mode, where
+    // every command asks. This test is about trust, not the sandbox.
+    crate::sandbox::TEST_MODE.with(|m| m.set(Some(crate::sandbox::Mode::Off)));
+    // Put the cwd back even if an assertion fails, so no later test runs in
+    // this project.
+    struct Back(std::path::PathBuf);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+            crate::sandbox::TEST_MODE.with(|m| m.set(None));
+        }
+    }
+    let _back = Back(std::env::current_dir().unwrap());
     std::env::set_current_dir(&proj).unwrap();
     let script = proj.join(".buildwithnexus/check.sh");
     std::fs::write(&script, "#!/bin/sh\necho ok-1\n").unwrap();
@@ -2365,7 +2375,7 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     // Trust withdrawn by removing the store: refused again at once.
     std::fs::remove_file(home.join("trusted.json")).unwrap();
     assert!(gated(&make).0.is_some());
-    std::env::set_current_dir(old_cwd).unwrap();
+    drop(_back);
     std::env::remove_var("NEXUS_HOME");
     if base != real {
         let _ = std::fs::remove_file(&base);
