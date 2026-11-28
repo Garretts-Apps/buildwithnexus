@@ -6,7 +6,41 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking changes
+- **Headless auto runs ask more after reading the project's files (roadmap
+  5.1).** In `--json` runs and the GitHub Action, an ask is a denial. Once
+  the session has read a project file or command output, three things now
+  end the run with exit 3 (`approval_blocked`):
+  - a fetch or web search to a host the task didn't name;
+  - an MCP call that can change things;
+  - an edit of a CI, hook or policy file.
+
+  To let one through, name the host in the task or add an allow rule for
+  the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
+
 ### Security
+- **Memory the model saves is treated as its text (roadmap 5.3).**
+  - **When saved:** `save_memory` notes are tagged as the model's and
+    shown as they are saved. If the session had read someone else's text,
+    the tag says so. A note can't add an untagged line.
+  - **In a later session:** loaded memory gives the session the matching
+    mark from roadmap 5.1. Notes saved after reading untrusted text make
+    commands, fetches and MCP calls ask. The model's other notes make
+    fetches, MCP writes and CI edits ask.
+  - **Your own notes:** `/memory` entries mark nothing.
+- **Every tool result names its source, and auto mode acts on it (roadmap
+  5.1).** Each result is labelled with where its text came from, and the
+  label survives resume and compaction.
+  - **Someone else's text:** web, search and MCP results, files in
+    dependency folders or outside the workspace, and the output of a
+    command that reached the network. It is labelled as untrusted for the
+    model. Auto mode then asks before commands, fetches and MCP calls.
+  - **The project's own text:** files and offline command output. Auto
+    mode asks before a fetch to a host you didn't name (this machine's own
+    servers excepted) and before MCP writes. Sandboxed commands run.
+  - **CI, hook and policy files:** after either kind of read, an edit of
+    one asks, by file tool or by a command that names it. The sandbox
+    keeps the existing files read-only to commands.
 - **Azure OpenAI (Foundry), with its key bound to Azure (roadmap 4.4).**
   `"provider": "azure"` with your resource's v1 endpoint as `base_url`
   sends `AZURE_OPENAI_API_KEY` in the `api-key` header, and only to a host

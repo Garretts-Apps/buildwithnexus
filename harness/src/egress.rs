@@ -291,6 +291,20 @@ pub fn check(
     Ok(addrs)
 }
 
+// Connections the proxy let a command make to another machine (roadmap
+// 5.1): a command's output is someone else's text once it reached out.
+static REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn note_reached_for_test() {
+    REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many connections to other machines commands have made so far.
+pub fn reached() -> u64 {
+    REACHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The proxy, started on the first sandboxed command that may use the
 /// network, and kept for the session.
 pub struct Proxy {
@@ -426,6 +440,9 @@ fn serve(client: TcpStream, cwd: &Path, private: bool) -> std::io::Result<()> {
         Ok(a) => a,
         Err(why) => return refuse(client, &label, &why),
     };
+    if !(host == "localhost" || addrs.iter().all(|a| a.ip().is_loopback()) && !addrs.is_empty()) {
+        REACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // From the private namespace, "this machine" is the namespace: a
     // loopback target is dialled inside it, never on the host or through an
     // upstream proxy.

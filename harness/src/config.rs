@@ -941,6 +941,50 @@ pub fn save_memory(content: &str) {
     write_atomic(&memory_path(), content, false);
 }
 
+/// The tag on a memory entry the model saved (roadmap 5.3).
+pub const MODEL_MEMORY_TAG: &str = "(saved by the model)";
+/// The tag on one it saved after the session read someone else's text.
+pub const MODEL_MEMORY_UNTRUSTED_TAG: &str = "(saved by the model after reading untrusted text)";
+
+/// Save a note the model asked to keep (`save_memory`). It is tagged as the
+/// model's, and as written after reading someone else's text when the
+/// session had, so a later session treats it as data (roadmap 5.3). Line
+/// breaks become spaces, so a note can't add an untagged line that would
+/// read as the user's own.
+pub fn append_model_memory(note: &str, after_untrusted: bool) {
+    let flat: String = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return;
+    }
+    let tag = if after_untrusted {
+        MODEL_MEMORY_UNTRUSTED_TAG
+    } else {
+        MODEL_MEMORY_TAG
+    };
+    append_memory(&format!("{tag} {flat}"));
+    // Shown as it is saved, so the user sees what a later session will read.
+    crate::report::notice(&format!(
+        "  memory: the model saved \"{}\" (/memory to review or clear it)",
+        crate::tui::sanitize_terminal(&flat)
+    ));
+}
+
+/// What the memory holds that someone other than the user wrote: Some(true)
+/// for an entry saved after reading untrusted text, Some(false) for only
+/// the model's own notes, None for none.
+pub fn memory_provenance() -> Option<bool> {
+    let m = load_memory()?;
+    let mut model = false;
+    for line in m.lines() {
+        let entry = line.trim_start().trim_start_matches("- ");
+        if entry.starts_with(MODEL_MEMORY_UNTRUSTED_TAG) {
+            return Some(true);
+        }
+        model |= entry.starts_with(MODEL_MEMORY_TAG);
+    }
+    model.then_some(false)
+}
+
 pub fn append_memory(entry: &str) {
     ensure_home();
     let existing = load_memory().unwrap_or_default();

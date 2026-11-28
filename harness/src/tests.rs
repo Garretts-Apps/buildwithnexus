@@ -1858,6 +1858,7 @@ fn context_breakdown_counts_each_part_of_the_next_request() {
             content: "r".repeat(40),
             is_error: false,
             images: Vec::new(),
+            source: None,
         }]),
     ];
     let tools = vec![tools::ToolDef {

@@ -360,6 +360,7 @@ pub(super) fn draft_plan(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -390,6 +391,7 @@ pub(super) fn draft_plan(
                         content,
                         is_error: true,
                         images: Vec::new(),
+                        source: None,
                     });
                     let fallback = fallback_exit_plan_input(task);
                     report::tool_call(
@@ -434,6 +436,7 @@ pub(super) fn draft_plan(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -463,12 +466,13 @@ pub(super) fn draft_plan(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
             if call.name == "save_memory" {
                 if let Some(note) = call_input["note"].as_str() {
-                    config::append_memory(note);
+                    config::append_model_memory(note, crate::agent::untrusted_read().is_some());
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
                     trace_tool_result(&call.name, &msg, false, "plan", 0);
@@ -477,6 +481,7 @@ pub(super) fn draft_plan(
                         content: msg,
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -498,6 +503,7 @@ pub(super) fn draft_plan(
                 content: out.content,
                 is_error: out.is_error,
                 images: out.images,
+                source: out.source,
             });
         }
         msgs.push(Msg::Assistant {

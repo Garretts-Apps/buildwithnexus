@@ -736,10 +736,46 @@ session can reach: the permission and sandbox modes, the added folders, which
 credential stores are hidden, and the hosts `network.allow` names. If any of
 these changes in the session (`/permissions`, `/sandbox`, `/add-dir`, a typed
 switch, an edited settings file), the check asks again before the next model
-request. Text from web pages, search results
-and MCP servers is labelled as untrusted for the model, and after a session
-reads any, auto mode asks before commands, fetches and MCP calls that can
-change things.
+request.
+
+Every tool result carries its source (roadmap 5.1), kept in the session
+file and through compaction, so a resumed session knows what it read:
+- **Someone else's text:** web pages, search results, MCP servers' output,
+  files in a dependency folder (`node_modules`, `vendor`, `site-packages`,
+  `.venv`, `go/pkg/mod`, …) or outside the workspace, and the output of a
+  command that reached the network through the checker or that names a
+  dependency folder. It is labelled as
+  untrusted for the model. After a session reads any, auto mode asks
+  before commands, fetches and MCP calls that can change things.
+- **The project's own text:** its files, and the output of commands that
+  stayed on this machine. A code comment can carry a planted instruction
+  too. After a session reads any, auto mode asks before a fetch to a host
+  you didn't name (this machine's own servers excepted) and before MCP
+  calls that can change things. Sandboxed commands carry on.
+- **Memory:** a note the model saves with `save_memory` is tagged as the
+  model's when it is saved, and shown to you then. If the session had
+  read someone else's text, the tag says so too. Line breaks in a note
+  become spaces, so the model can't add an untagged line that reads as
+  yours. `memory.md` is in bwn's folder, which commands and file tools
+  can't reach.
+
+  A later session that loads the memory starts marked by it: notes saved
+  after reading untrusted text count as someone else's text, and the
+  model's other notes count as the project's own. The prompt tells the
+  model that tagged entries are data. Notes you add with `/memory` count
+  as yours.
+- **CI, hook and policy files:** after either kind of read, auto mode asks
+  before an edit of one, whether through a file tool or a command that
+  names it. The files are `.github`, `.gitlab-ci.yml`, `.circleci`,
+  `azure-pipelines.yml`, `Jenkinsfile`, `.buildkite`, `.husky`,
+  `.pre-commit-config.yaml`, `lefthook.yml`, `.envrc`, `.git` and
+  `.buildwithnexus`. The sandbox (bubblewrap, the namespace backend and
+  Seatbelt) makes those that exist read-only to commands. One changed
+  some other way is caught when the turn ends: for example, a file made
+  where none was, under a name a command built at run time, or a change
+  by brokered git. The run ends `approval_blocked` and names the file,
+  and the change isn't committed. `.git` and `.buildwithnexus` are
+  read-only to commands on every backend.
 
 ### What the automatic checks do not guarantee
 

@@ -8,7 +8,9 @@
 // tree unchanged.
 #![cfg(unix)]
 
-use super::run;
+// The dispatcher itself: the source labels `run` adds on top (roadmap 5.1)
+// are policy, not the search or read this file holds steady.
+use super::run_tool as run;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};

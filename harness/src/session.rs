@@ -1351,6 +1351,7 @@ mod tests {
                     content: "TOOL OUTPUT BODY".into(),
                     is_error: false,
                     images: Vec::new(),
+                    source: None,
                 }]),
                 Msg::User("[harness] You called finish without running check_work".into()),
                 Msg::Assistant {
@@ -1454,6 +1455,7 @@ mod tests {
                 content: format!("// module {i}\n").repeat(40),
                 is_error: false,
                 images: Vec::new(),
+                source: None,
             }]),
         ]
     }

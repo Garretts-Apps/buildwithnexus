@@ -595,7 +595,7 @@ fn bwrap_argv(
         .collect();
     let mut protected: Vec<(String, bool)> = roots
         .iter()
-        .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
+        .flat_map(|r| workspace_protected(r))
         .filter(|_| protect)
         .map(|p| {
             let exists = p.symlink_metadata().is_ok();
@@ -780,14 +780,56 @@ const CONFINE_EXE: &str = "/run/bwn-confine";
 /// Workspace entries a sandboxed command may read but never write.
 const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
 
+/// The entries of `root` a sandboxed command may not write: `.git` and
+/// `.buildwithnexus` always, and once an auto-mode session has read text
+/// that could carry a planted instruction, its CI, hook and policy files
+/// too (roadmap 5.1; `tools::PROTECTED_PATHS`), those that exist.
+pub fn workspace_protected(root: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = PROTECTED_IN_WORKSPACE
+        .iter()
+        .map(|d| root.join(d))
+        .collect();
+    if planted_text_possible() {
+        v.extend(
+            crate::tools::PROTECTED_PATHS
+                .iter()
+                .filter(|d| !PROTECTED_IN_WORKSPACE.contains(d))
+                .map(|d| root.join(d))
+                .filter(|p| p.symlink_metadata().is_ok()),
+        );
+    }
+    v
+}
+
+// An auto-mode session that read text through a tool (roadmap 5.1).
+fn planted_text_possible() -> bool {
+    let auto = {
+        #[cfg(test)]
+        {
+            TEST_AUTO
+                .with(|a| a.get())
+                .unwrap_or_else(|| crate::hooks::permission_mode() == "auto")
+        }
+        #[cfg(not(test))]
+        {
+            crate::hooks::permission_mode() == "auto"
+        }
+    };
+    auto && (crate::agent::untrusted_read().is_some() || crate::agent::local_read().is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    // This thread's permission mode for `planted_text_possible`, so a test
+    // doesn't race others over the process-wide one.
+    pub(crate) static TEST_AUTO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The paths inside `roots` a sandboxed command must not write: each root's
 /// `.git` and `.buildwithnexus`, and the nested repositories' `.git` (within
 /// the same bounds bubblewrap uses).
 pub fn protected_paths(roots: &[&Path]) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = roots
-        .iter()
-        .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
-        .collect();
+    let mut v: Vec<PathBuf> = roots.iter().flat_map(|r| workspace_protected(r)).collect();
     for r in roots {
         for p in nested_git_entries(r) {
             if !v.contains(&p) {
@@ -1066,8 +1108,8 @@ pub fn seatbelt_profile(
     p.push_str(")\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (regex #\"^/dev/tty\"))\n");
     p.push_str("(deny file-write*");
     for root in &roots {
-        for d in PROTECTED_IN_WORKSPACE {
-            p.push_str(&format!("\n  (subpath {})", sbpl_quote(&root.join(d))));
+        for d in workspace_protected(root) {
+            p.push_str(&format!("\n  (subpath {})", sbpl_quote(&d)));
         }
         for nested in nested_git_entries(root) {
             p.push_str(&format!("\n  (subpath {})", sbpl_quote(&nested)));
@@ -1758,6 +1800,45 @@ pub(crate) mod tests {
         assert!(absent.contains(
             "--tmpfs /work/none/.buildwithnexus --remount-ro /work/none/.buildwithnexus"
         ));
+    }
+
+    // Roadmap 5.1: once an auto-mode session has read text that could carry
+    // a planted instruction, the workspace's CI, hook and policy files that
+    // exist are read-only to commands as well; before that, and outside
+    // auto mode, they are not.
+    #[cfg(unix)]
+    #[test]
+    fn invariant_so8_ci_and_hook_files_turn_read_only_once_text_is_read() {
+        let ws = std::env::temp_dir().join(format!("bwn-sandbox-so8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".github/workflows")).unwrap();
+        std::fs::write(ws.join(".pre-commit-config.yaml"), "repos: []\n").unwrap();
+        let w = ws.display().to_string();
+        let ci = format!("--ro-bind {w}/.github {w}/.github");
+        let hook = format!("--ro-bind {w}/.pre-commit-config.yaml {w}/.pre-commit-config.yaml");
+        let args = || bwrap_args("true", &ws, Net::Off).join(" ");
+        crate::agent::clear_untrusted_read();
+        TEST_AUTO.with(|a| a.set(Some(true)));
+        assert!(!args().contains(&ci), "read-only before anything was read");
+        crate::agent::mark_local_read("read_file");
+        let s = args();
+        assert!(s.contains(&ci) && s.contains(&hook), "{s}");
+        // An absent one isn't made (it would leave a folder behind).
+        assert!(!s.contains(".husky"), "{s}");
+        let profile = seatbelt_profile(&ws, &[], None, Net::Off, &[]);
+        assert!(
+            profile.contains(&format!("(subpath \"{w}/.github\")")),
+            "{profile}"
+        );
+        assert!(protected_paths(&[ws.as_path()]).contains(&ws.join(".github")));
+        TEST_AUTO.with(|a| a.set(Some(false)));
+        assert!(
+            !args().contains(&ci),
+            "outside auto mode commands were asked for"
+        );
+        TEST_AUTO.with(|a| a.set(None));
+        crate::agent::clear_untrusted_read();
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

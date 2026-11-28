@@ -175,6 +175,7 @@ pub(super) fn brainstorm_reply(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -198,6 +199,7 @@ pub(super) fn brainstorm_reply(
                     content: told,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -227,6 +229,7 @@ pub(super) fn brainstorm_reply(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -254,12 +257,13 @@ pub(super) fn brainstorm_reply(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
             if call.name == "save_memory" {
                 if let Some(note) = call_input["note"].as_str() {
-                    config::append_memory(note);
+                    config::append_model_memory(note, crate::agent::untrusted_read().is_some());
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
                     trace_tool_result(&call.name, &msg, false, "brainstorm", 0);
@@ -268,6 +272,7 @@ pub(super) fn brainstorm_reply(
                         content: msg,
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -293,6 +298,7 @@ pub(super) fn brainstorm_reply(
                 content: out.content,
                 is_error: out.is_error,
                 images: out.images,
+                source: out.source,
             });
         }
         msgs.push(Msg::Assistant {
@@ -499,6 +505,7 @@ pub(super) fn chat_rounds(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -522,6 +529,7 @@ pub(super) fn chat_rounds(
                     content: told,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -551,6 +559,7 @@ pub(super) fn chat_rounds(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -580,6 +589,7 @@ pub(super) fn chat_rounds(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -605,6 +615,7 @@ pub(super) fn chat_rounds(
                 content: out.content,
                 is_error: out.is_error,
                 images: out.images,
+                source: out.source,
             });
         }
 

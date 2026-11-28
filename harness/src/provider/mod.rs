@@ -111,6 +111,24 @@ pub struct ToolResult {
     /// user turn right after the round's tool messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<(String, String)>,
+    /// Where the text came from (roadmap 5.1), kept in the session file so
+    /// a resumed session knows what it read. None for a tool's own report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// The source of a tool result's text (roadmap 5.1, SO-8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tier", content = "via", rename_all = "snake_case")]
+pub enum Source {
+    /// Someone else wrote it: a web page, a search result, an MCP server's
+    /// output, a file in a dependency folder or outside the workspace, or a
+    /// command's output after the command reached the network. Names the
+    /// tool.
+    External(String),
+    /// The project's own files, or a command's output that stayed on this
+    /// machine. Names the tool.
+    Workspace(String),
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Msg {

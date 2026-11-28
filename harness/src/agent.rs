@@ -901,12 +901,16 @@ fn phase_readonly_reason(reason: String, phase_msg: &str) -> String {
 struct Untrusted {
     sid: String,
     tool: Option<String>,
+    /// The tool through which the session first read the project's own
+    /// text (roadmap 5.1's workspace tier).
+    local: Option<String>,
 }
 
 #[cfg(not(test))]
 static UNTRUSTED: std::sync::Mutex<Untrusted> = std::sync::Mutex::new(Untrusted {
     sid: String::new(),
     tool: None,
+    local: None,
 });
 
 fn with_untrusted<T>(f: impl FnOnce(&mut Untrusted) -> T) -> T {
@@ -931,6 +935,21 @@ pub fn mark_untrusted_read(tool: &str) {
     with_untrusted(|u| {
         u.tool.get_or_insert_with(|| tool.to_string());
     });
+}
+
+/// The session read the project's own text (a file, a command's output
+/// that stayed on this machine) through `tool`. It may hold a planted
+/// instruction too (roadmap 5.1): from here on auto mode asks before
+/// fetches, MCP writes and edits of CI, hook or policy files.
+pub fn mark_local_read(tool: &str) {
+    with_untrusted(|u| {
+        u.local.get_or_insert_with(|| tool.to_string());
+    });
+}
+
+/// The tool through which this session first read the project's own text.
+pub fn local_read() -> Option<String> {
+    with_untrusted(|u| u.local.clone())
 }
 
 /// The tool through which this session first read untrusted text, if any.
@@ -966,8 +985,33 @@ pub fn sync_untrusted(sid: &str, msgs: &[Msg]) {
             return;
         }
         u.sid = sid.to_string();
-        u.tool = untrusted_tool_in(msgs);
+        // The memory a session starts with is in its prompt: notes the
+        // model saved are text it may have taken from anywhere (roadmap
+        // 5.3).
+        let memory = crate::config::memory_provenance();
+        u.tool = untrusted_tool_in(msgs).or_else(|| {
+            (memory == Some(true))
+                .then(|| "memory (a note saved after reading untrusted text)".to_string())
+        });
+        u.local = local_tool_in(msgs).or_else(|| memory.is_some().then(|| "memory".to_string()));
     });
+}
+
+/// The tool through which `msgs` first show the project's own text: a
+/// result labelled with that source, or a compaction's note of one.
+pub(crate) fn local_tool_in(msgs: &[Msg]) -> Option<String> {
+    let note = |text: &str| {
+        let rest = text.split_once("[project content from ")?.1;
+        rest.split_once(':').map(|(t, _)| t.to_string())
+    };
+    msgs.iter().find_map(|m| match m {
+        Msg::Tool(results) => results.iter().find_map(|r| match &r.source {
+            Some(crate::provider::Source::Workspace(t)) => Some(t.clone()),
+            _ => note(&r.content),
+        }),
+        Msg::User(text) | Msg::UserImages { text, .. } => note(text),
+        _ => None,
+    })
 }
 
 /// The tool through which `msgs` first show untrusted text: a labelled
@@ -979,7 +1023,10 @@ pub(crate) fn untrusted_tool_in(msgs: &[Msg]) -> Option<String> {
         rest.split_once(':').map(|(t, _)| t.to_string())
     };
     msgs.iter().find_map(|m| match m {
-        Msg::Tool(results) => results.iter().find_map(|r| from(&r.content)),
+        Msg::Tool(results) => results.iter().find_map(|r| match &r.source {
+            Some(crate::provider::Source::External(t)) => Some(t.clone()),
+            _ => from(&r.content),
+        }),
         Msg::User(text) | Msg::UserImages { text, .. } => from(text),
         _ => None,
     })
@@ -1009,10 +1056,63 @@ fn auto_asks(
     let mcp_action =
         (name.starts_with("mcp__") || name == "mcp_call") && tools::is_mutating_call(name, input);
     let reaches_out = host.is_some() || mcp_action;
+    let external = untrusted_read();
+    let local = local_read();
+    // Roadmap 5.1: once the session has read text that could carry a
+    // planted instruction (anyone's, the project's own included), an edit
+    // of a CI, hook or policy file asks, through a file tool or a command.
+    if let Some(tool) = external.as_ref().or(local.as_ref()) {
+        // A call that changes paths without being a command: a file tool's
+        // write, move or removal.
+        let edit = any_cmd.is_none() && tools::is_mutating_call(name, input);
+        let protected = (edit
+            && tools::touched_paths(name, input, cwd)
+                .iter()
+                .any(|p| tools::is_protected_path(p, cwd)))
+            || (command && any_cmd.is_some_and(|c| tools::command_names_protected_path(c, cwd)));
+        if protected {
+            return Some(format!(
+                "auto mode asks: this changes a CI, hook or policy file, and this session read text through {tool} that could carry a planted instruction"
+            ));
+        }
+    }
     if command || reaches_out {
-        if let Some(tool) = untrusted_read() {
+        if let Some(tool) = &external {
             return Some(format!(
                 "auto mode asks: this session read content from {tool} that someone else wrote, and it may carry instructions"
+            ));
+        }
+    }
+    // The project's own text (roadmap 5.1's workspace tier): sandboxed
+    // commands carry on, but what reaches another machine asks, unless the
+    // user named the host.
+    if let Some(tool) = &local {
+        let named = host.is_some_and(|h| {
+            crate::egress::user_hosts()
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(h))
+        });
+        // This machine's own servers (a dev server) aren't another machine.
+        let loopback = host.is_some_and(|h| {
+            let name = match h.parse::<std::net::SocketAddr>() {
+                Ok(a) => return a.ip().is_loopback(),
+                Err(_) => h.rsplit_once(':').map_or(h, |(n, p)| {
+                    if p.bytes().all(|b| b.is_ascii_digit()) {
+                        n
+                    } else {
+                        h
+                    }
+                }),
+            };
+            let name = name.trim_matches(['[', ']']);
+            name.eq_ignore_ascii_case("localhost")
+                || name
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        if (host.is_some() && !named && !loopback) || mcp_action {
+            return Some(format!(
+                "auto mode asks: this reaches another machine, and this session read the project's text through {tool}, which could carry a planted instruction"
             ));
         }
     }
@@ -2325,6 +2425,11 @@ fn on_text_reply(
 /// What one BUILD turn tracks across its steps.
 #[derive(Default)]
 struct TurnState {
+    /// A command this turn named a CI, hook or policy path, and so went
+    /// through the gate that asks about them (roadmap 5.1).
+    named_protected: bool,
+    /// The turn changed a CI, hook or policy file that nothing asked about.
+    protected_unasked: bool,
     /// Files read this turn, for read-before-write.
     read_paths: std::collections::HashSet<PathBuf>,
     loop_guard: ToolLoopGuard,
@@ -2642,6 +2747,7 @@ fn build_turn(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2671,6 +2777,7 @@ fn build_turn(
                     content: told,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2708,6 +2815,7 @@ fn build_turn(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2792,6 +2900,7 @@ fn build_turn(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2823,6 +2932,7 @@ fn build_turn(
                         content: msg,
                         is_error: true,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -2840,6 +2950,7 @@ fn build_turn(
                     content: String::new(),
                     is_error: false,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2860,6 +2971,7 @@ fn build_turn(
                         content: String::new(),
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -2871,13 +2983,14 @@ fn build_turn(
                     content: out,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
             // Memory-save tool: the model can call save_memory to persist facts.
             if call.name == "save_memory" {
                 if let Some(note) = call_input["note"].as_str() {
-                    config::append_memory(note);
+                    config::append_model_memory(note, crate::agent::untrusted_read().is_some());
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
                     trace_tool_result(&call.name, &msg, false, "build", depth);
@@ -2886,6 +2999,7 @@ fn build_turn(
                         content: msg,
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -2961,6 +3075,43 @@ fn build_turn(
                 _ => false,
             };
             if let (Some(base), Some(now)) = (&st.tree_base, &now) {
+                // Roadmap 5.1: in an auto session that read text, a CI, hook
+                // or policy file the turn changed with no file tool and no
+                // command naming it (a name built at run time, a file
+                // created where none was, brokered git) was never asked
+                // about. The run says so, and the change isn't committed.
+                let tainted = untrusted_read().or_else(local_read);
+                if let (Permission::Auto, Some(tool), false) = (perm, &tainted, st.named_protected)
+                {
+                    let by_tools = st.changed_files.clone();
+                    for p in crate::tree::changed_paths(base, now, cwd) {
+                        let shown = p.display().to_string();
+                        // `.git` and `.buildwithnexus` are read-only to
+                        // commands on every backend (and on Landlock alone
+                        // each command asks); bwn writes its own state in
+                        // the second.
+                        let first = p
+                            .strip_prefix(cwd)
+                            .ok()
+                            .and_then(|r| r.components().next())
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+                        let own = matches!(first.as_deref(), Some(".git" | ".buildwithnexus"));
+                        if !own && tools::is_protected_path(&p, cwd) && !by_tools.contains(&shown) {
+                            st.protected_unasked = true;
+                            let rel = p.strip_prefix(cwd).unwrap_or(&p).display().to_string();
+                            let why = format!(
+                                "{rel} changed without being asked about: it is a CI, hook or policy file, and this session read text through {tool} that could carry a planted instruction"
+                            );
+                            report::notice(&format!("  ⚠ {why}"));
+                            report::note_denial(
+                                "run_command",
+                                &format!("change {rel}"),
+                                &why,
+                                true,
+                            );
+                        }
+                    }
+                }
                 for p in crate::tree::changed_paths(base, now, cwd) {
                     let path = p.display().to_string();
                     if !st.changed_files.contains(&path) {
@@ -3154,6 +3305,9 @@ fn build_turn(
                 if st.check_work_passed == Some(false) {
                     hold_commit_notice();
                     stopped_short(Outcome::CheckWorkFailed);
+                } else if st.protected_unasked {
+                    hold_commit_notice();
+                    stopped_short(Outcome::ApprovalBlocked);
                 } else {
                     crate::evidence::note(crate::evidence::Facts {
                         checks_passed: st.check_work_passed,
@@ -3420,6 +3574,11 @@ fn record_outcome(
     input: &serde_json::Value,
     out: tools::Outcome,
 ) -> ToolResult {
+    if let Some(c) = input["command"].as_str() {
+        if tools::command_names_protected_path(c, ctx.cwd) {
+            st.named_protected = true;
+        }
+    }
     let mut out = vision_checked(ctx.p, out);
     post_tool_hooks(name, input, &mut out, ctx.cwd);
     if out.is_error {
@@ -3519,6 +3678,7 @@ fn record_outcome(
         content: out.content,
         is_error: out.is_error,
         images: out.images,
+        source: out.source,
     }
 }
 
