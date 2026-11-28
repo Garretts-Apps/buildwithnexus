@@ -13523,3 +13523,63 @@ fn invariant_cp4_background_work_merges_only_with_evidence() {
     assert!(refused.contains("don't verify"), "{refused}");
     assert!(!cwd.join("manual.txt").exists());
 }
+
+// Roadmap 5.8 (SD-8): an experiment runs a task as several background
+// agents, each in a worktree of its own, scores each by the verification
+// engine, and keeps the comparison as an evidence record; merging a variant
+// names it, and `evidence verify` checks the merge against it.
+#[test]
+fn an_experiments_result_is_in_the_evidence_record() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        let o = Command::new("git").args(args).current_dir(&cwd).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&["init", "-q", "-b", "main"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join(".gitignore"), ".bwn/\n").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    // Two variants: one writes one file, the other two.
+    let port = serve(vec![
+        tool_call("a", "write_file", json!({"path": "a.txt", "content": "a\n"})),
+        finish("done"),
+        tool_call_raw_args("b1", "write_file", &json!({"path": "b1.txt", "content": "b\n"}).to_string()),
+        tool_call("b2", "write_file", json!({"path": "b2.txt", "content": "b\n"})),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let bwn = |args: &[&str]| {
+        let o = Command::new(BIN).args(args).current_dir(&cwd).env("NEXUS_HOME", &home).output().unwrap();
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let (code, said) = bwn(&["bg", "try", "2", "add a file"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("2 variants"), "{said}");
+    // The best variant is listed first; merge it.
+    let best = said
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .to_string();
+    let (code, merged) = bwn(&["bg", "merge", &best]);
+    assert_eq!(code, Some(0), "{merged}");
+    let body = g(&["log", "-1", "--format=%B"]);
+    assert!(body.contains("Bwn-Experiment: "), "{body}");
+    let (code, verified) = bwn(&["evidence", "verify", "HEAD"]);
+    assert_eq!(code, Some(0), "{verified}");
+    assert!(verified.contains("of experiment") && verified.contains("2 variants"), "{verified}");
+}

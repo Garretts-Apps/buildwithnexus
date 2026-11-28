@@ -19,6 +19,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Experiments scored by verification (roadmap 5.8).**
+  `buildwithnexus bg try <n> <task>` runs the task as n background agents
+  in worktrees of their own. Each variant is scored by whether its commits
+  verify, whether the run succeeded, and how much it changed, and the
+  comparison is kept as an evidence record. Merging a variant with
+  `bg merge` adds a `Bwn-Experiment:` trailer that names the record, and
+  `evidence verify` checks it.
 - **Background agents in worktrees of their own (roadmap 5.2).**
   - **Starting:** `/bg <task>` (or `buildwithnexus bg run <task>`) runs the
     task as a child of the session, on a new branch in its own worktree,

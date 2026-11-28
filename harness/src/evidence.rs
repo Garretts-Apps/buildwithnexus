@@ -94,9 +94,64 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// The trailer naming an experiment's record (roadmap 5.8).
+pub const EXPERIMENT_TRAILER: &str = "Bwn-Experiment";
+
+/// Keep `rec` (canonical JSON) in the evidence store under its SHA-256,
+/// and return the hash.
+pub fn store(rec: &Value) -> Option<String> {
+    let text = serde_json::to_string(rec).ok()?;
+    let hash = sha256_hex(text.as_bytes());
+    crate::config::ensure_home();
+    std::fs::create_dir_all(dir()).ok()?;
+    std::fs::write(dir().join(format!("{hash}.json")), &text).ok()?;
+    Some(hash)
+}
+
+// A record by its hash, checked against it.
+fn load(hash: &str) -> Result<Value, String> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("`{hash}` isn't a record's hash"));
+    }
+    let path = dir().join(format!("{hash}.json"));
+    let text = std::fs::read(&path).map_err(|e| format!("no record at {}: {e}", path.display()))?;
+    if sha256_hex(&text) != hash {
+        return Err("the record was changed after the commit named it".into());
+    }
+    serde_json::from_slice(&text).map_err(|e| format!("the record isn't JSON: {e}"))
+}
+
+// A merge commit naming an experiment: its record, and that the merged
+// branch is the variant the record names and its head is this merge's.
+fn verify_experiment(cwd: &Path, commit: &str, hash: &str) -> Result<String, String> {
+    let rec = load(hash)?;
+    let parents = git(cwd, &["rev-list", "--parents", "-n", "1", commit])?;
+    let merged: Vec<&str> = parents.split_whitespace().skip(2).collect();
+    let chosen = rec["variants"]
+        .as_array()
+        .and_then(|v| {
+            v.iter()
+                .find(|x| merged.iter().any(|m| Some(*m) == x["head"].as_str()))
+        })
+        .ok_or("the merged branch isn't one of the experiment's variants")?;
+    Ok(format!(
+        "ok: {commit} merges variant {} of experiment {} ({} variants, score {})",
+        chosen["branch"].as_str().unwrap_or("?"),
+        &hash[..12],
+        rec["variants"].as_array().map_or(0, Vec::len),
+        chosen["score"]
+    ))
+}
+
 /// Check `commit` against its evidence record. Ok is a one-line summary.
 pub fn verify(cwd: &Path, commit: &str) -> Result<String, String> {
     let body = git(cwd, &["log", "-1", "--format=%B", commit])?;
+    if let Some(h) = body
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{EXPERIMENT_TRAILER}:")))
+    {
+        return verify_experiment(cwd, commit, h.trim());
+    }
     let hash = body
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{TRAILER}:")))

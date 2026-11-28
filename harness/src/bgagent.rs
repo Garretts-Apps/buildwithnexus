@@ -66,6 +66,88 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+// The branch → experiment-record index (roadmap 5.8), in bwn's folder.
+fn experiments_index() -> PathBuf {
+    crate::config::home().join("experiments.json")
+}
+
+fn experiment_of(branch: &str) -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(experiments_index()).ok()?).ok()?;
+    v[branch].as_str().map(str::to_string)
+}
+
+/// Roadmap 5.8: run `task` as `n` background agents, each in a worktree
+/// of its own, and score each by the verification engine: whether every
+/// commit verifies against its evidence record, whether its checks passed,
+/// and how much it changed. The comparison is an evidence record of its
+/// own; merging a variant names it.
+pub fn experiment(
+    cwd: &Path,
+    n: usize,
+    task: &str,
+) -> Result<(String, Vec<serde_json::Value>), String> {
+    let mut variants = Vec::new();
+    for i in 0..n {
+        let s = start(task, cwd, crate::workflow::session_child_args(task))?;
+        let branch = s.branch.clone();
+        let base = s.base.clone();
+        let ok = s
+            .child
+            .wait_with_output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let commits =
+            git(cwd, &["rev-list", &format!("{base}..refs/heads/{branch}")]).unwrap_or_default();
+        let commits: Vec<&str> = commits.lines().filter(|l| !l.is_empty()).collect();
+        let verified = !commits.is_empty()
+            && commits
+                .iter()
+                .all(|c| crate::evidence::verify(cwd, c).is_ok());
+        let changed = git(
+            cwd,
+            &["diff", "--numstat", &format!("{base}..refs/heads/{branch}")],
+        )
+        .unwrap_or_default()
+        .lines()
+        .count();
+        let head = git(cwd, &["rev-parse", &format!("refs/heads/{branch}")])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // Verified work first, then a run that ended well, then the smaller change.
+        let score = i64::from(verified) * 1000 + i64::from(ok) * 100 - changed.min(99) as i64;
+        variants.push(serde_json::json!({
+            "variant": i + 1, "branch": branch, "head": head, "commits": commits.len(),
+            "verified": verified, "run_succeeded": ok, "files_changed": changed, "score": score,
+        }));
+    }
+    let rec = serde_json::json!({
+        "version": 1,
+        "kind": "experiment",
+        "time": crate::knowledge::chrono_now_iso(),
+        "task": task,
+        "variants": variants,
+    });
+    let hash = crate::evidence::store(&rec).ok_or("could not write the experiment record")?;
+    let mut index: serde_json::Value = std::fs::read_to_string(experiments_index())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    for v in rec["variants"].as_array().into_iter().flatten() {
+        if let Some(b) = v["branch"].as_str() {
+            index[b] = hash.clone().into();
+        }
+    }
+    crate::config::ensure_home();
+    let _ = std::fs::write(experiments_index(), index.to_string());
+    Ok((
+        hash,
+        rec["variants"].as_array().cloned().unwrap_or_default(),
+    ))
+}
+
 /// Merge `branch` into the current branch of `cwd` when every commit it
 /// adds verifies against its evidence record; otherwise nothing is merged
 /// and each commit that doesn't verify is named.
@@ -111,12 +193,21 @@ pub fn merge(cwd: &Path, branch: &str) -> Result<String, String> {
             failed.join("\n")
         ));
     }
+    // A variant of an experiment: the merge names the comparison it won.
+    let message = match experiment_of(branch) {
+        Some(h) => format!(
+            "Merge background work from {branch}\n\n{}: {h}\n",
+            crate::evidence::EXPERIMENT_TRAILER
+        ),
+        None => format!("Merge background work from {branch}\n"),
+    };
     git(
         cwd,
         &[
             "merge",
             "--no-ff",
-            "--no-edit",
+            "-m",
+            &message,
             &format!("refs/heads/{branch}"),
         ],
     )?;
@@ -201,6 +292,46 @@ pub fn cli(args: &[String]) -> i32 {
                 }
             }
         }
+        [verb, n, rest @ ..] if verb == "try" && !rest.is_empty() => {
+            let Ok(n) = n.parse::<usize>().map(|n| n.clamp(1, 8)) else {
+                eprintln!("usage: buildwithnexus bg try <n> <task>");
+                return 2;
+            };
+            if let Some(s) = crate::config::load_settings() {
+                crate::workflow::set_launch(
+                    &s.provider,
+                    &s.model,
+                    s.base_url.as_deref().unwrap_or(""),
+                    &s.permission,
+                );
+            }
+            match experiment(&cwd, n, &rest.join(" ")) {
+                Ok((hash, variants)) => {
+                    println!(
+                        "experiment {} ({} variants), best first:",
+                        &hash[..12],
+                        variants.len()
+                    );
+                    let mut v = variants;
+                    v.sort_by_key(|x| -x["score"].as_i64().unwrap_or(0));
+                    for x in v {
+                        println!(
+                            "  {}  score {}  verified {}  files {}",
+                            x["branch"].as_str().unwrap_or("?"),
+                            x["score"],
+                            x["verified"],
+                            x["files_changed"]
+                        );
+                    }
+                    println!("`buildwithnexus bg merge <branch>` merges one; the merge names this experiment");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("buildwithnexus: {e}");
+                    1
+                }
+            }
+        }
         [verb, branch] if verb == "merge" => match merge(&cwd, branch) {
             Ok(line) => {
                 println!("{line}");
@@ -212,7 +343,9 @@ pub fn cli(args: &[String]) -> i32 {
             }
         },
         _ => {
-            eprintln!("usage: buildwithnexus bg run <task> | buildwithnexus bg merge <branch>");
+            eprintln!(
+                "usage: buildwithnexus bg run <task> | bg try <n> <task> | bg merge <branch>"
+            );
             2
         }
     }

@@ -483,6 +483,12 @@ roadmap 5.2) is such a child, never a daemon:
   `buildwithnexus bg merge <branch>`, a command you run. It merges only
   when every commit the branch adds verifies against its record, and
   otherwise names each commit that doesn't.
+- **Experiments:** `buildwithnexus bg try <n> <task>` (roadmap 5.8) runs
+  the task as n such agents and scores each one: whether every commit
+  verifies, whether the run succeeded, and how much it changed. The
+  comparison is kept as a content-hashed record in the evidence store.
+  Merging a variant names that record in a `Bwn-Experiment:` trailer, and
+  `buildwithnexus evidence verify` checks the merge against it.
 
 So a workflow started after the session read untrusted text keeps asking in
 auto mode, and one started from `--sandbox require` keeps `require`. Its
