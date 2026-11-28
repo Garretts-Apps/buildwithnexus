@@ -7,6 +7,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **macOS: sandboxed commands can no longer read the keychain.** Seatbelt
+  allowed commands to reach the keychain daemon. A keychain item trusts
+  the program that created it, so a sandboxed `security
+  find-generic-password` read items back. The same path reached git's
+  stored GitHub token through `git credential-osxkeychain`. The profile now
+  refuses those services; certificate trust for TLS is unaffected.
+  **Breaking:** git operations inside a sandboxed command that rely on
+  keychain-stored credentials now fail. Run them outside the sandbox, or
+  use a token in the environment that the command is meant to have.
 - **A decision log for every session.** Gate decisions, approvals, session
   exceptions, startup-check acceptances and verification results go to
   `~/.buildwithnexus/audit/<session>.jsonl`, one hash-chained line each.

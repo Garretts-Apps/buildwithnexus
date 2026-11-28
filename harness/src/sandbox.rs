@@ -1032,6 +1032,9 @@ fn sbpl_quote(p: &Path) -> String {
 /// workspace and the temp dirs. Callers pass realpath'd paths so `/var/…`
 /// and `/private/var/…` agree.
 /// Folders added with --add-dir (`extra`) are writable like the workspace.
+/// The keychain daemon's services, refused to commands (see seatbelt_profile).
+const KEYCHAIN_DENY: &str = "(deny mach-lookup\n  (global-name \"com.apple.SecurityServer\")\n  (global-name \"com.apple.securityd.xpc\")\n  (global-name \"com.apple.security.agent\")\n  (global-name \"com.apple.security.authhost\"))\n";
+
 pub fn seatbelt_profile(
     cwd: &Path,
     extra: &[PathBuf],
@@ -1063,6 +1066,11 @@ pub fn seatbelt_profile(
         }
     }
     p.push_str(")\n(deny appleevent-send)\n");
+    // The keychain: an item trusts the program that made it, so a command
+    // running that program (`security`, git's credential-osxkeychain) would
+    // read it back. Certificate trust for TLS goes through trustd, which
+    // stays reachable.
+    p.push_str(KEYCHAIN_DENY);
     match net {
         Net::Off | Net::Private(_) => p.push_str("(deny network*)\n"),
         // Out only to the proxy on loopback; listening and accepting stay
@@ -1851,6 +1859,10 @@ pub(crate) mod tests {
         );
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
+        assert!(
+            p.contains("(global-name \"com.apple.SecurityServer\")"),
+            "{p}"
+        );
         assert!(!p.contains("network"));
         let no_net = seatbelt_profile(Path::new("/w"), &[], None, Net::Off, &[]);
         assert!(no_net.ends_with("(deny network*)\n"));
