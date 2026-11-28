@@ -494,6 +494,10 @@ pub struct Settings {
     /// `keep_recent` messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionSettings>,
+    /// A model on the same endpoint to try once when the session's is
+    /// rate-limited or overloaded past its retries (roadmap 4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -633,6 +637,7 @@ impl Default for Settings {
             checks: None,
             security_gates: Vec::new(),
             compaction: None,
+            fallback_model: None,
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),
@@ -1605,6 +1610,9 @@ fn skill_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource, bool)> {
         roots.push((u.join(".claude").join("skills"), SkillSource::Claude, false));
     }
     roots.push((skills_dir(), SkillSource::User, false));
+    for p in plugin_dirs(cwd) {
+        roots.push((p.join("skills"), SkillSource::User, false));
+    }
     // Only the user's own entries can name a folder outside the checkout:
     // a project file could write an absolute path back into it.
     let user_dirs = load_user_settings()
@@ -2090,10 +2098,71 @@ pub struct CustomCommand {
 // Command folders in precedence order: the user's own first, then the
 // checkout's once its commands are trusted (marked true: read as project
 // files). A name already taken is skipped.
+// ── plugins (roadmap 4.6) ───────────────────────────────────────────────────
+
+/// The folders of the enabled plugins in `plugins`: `{"name": true}` is
+/// NEXUS_HOME/plugins/name; `{"name": {"path": "~/p"}}` or `{"name": "~/p"}`
+/// a folder of its own; `{"name": {"enabled": false}}` is off. A plugin
+/// is one unit: its `commands/`, `skills/` and `agents/` folders, and the
+/// `hooks` and `mcp_servers` in its `plugin.json`, load together.
+fn plugin_dirs_from(plugins: &serde_json::Map<String, serde_json::Value>) -> Vec<PathBuf> {
+    let resolve = |p: &str| -> Option<PathBuf> {
+        let p = p.trim();
+        if let Some(rest) = p.strip_prefix("~/") {
+            return user_home().map(|u| u.join(rest));
+        }
+        let path = Path::new(p);
+        Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            home().join("plugins").join(p)
+        })
+    };
+    plugins
+        .iter()
+        .filter_map(|(name, v)| match v {
+            serde_json::Value::Bool(true) => resolve(name),
+            serde_json::Value::String(p) => resolve(p),
+            serde_json::Value::Object(o)
+                if o.get("enabled").and_then(|e| e.as_bool()) != Some(false) =>
+            {
+                resolve(o.get("path").and_then(|p| p.as_str()).unwrap_or(name))
+            }
+            _ => None,
+        })
+        .filter(|d| d.is_dir())
+        .collect()
+}
+
+fn read_plugin_json(dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&fs::read_to_string(dir.join("plugin.json")).ok()?).ok()
+}
+
+/// The enabled plugins' folders for `cwd`'s settings.
+pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
+    load_settings_from_dir(cwd)
+        .map(|s| plugin_dirs_from(&s.plugins.into_iter().collect()))
+        .unwrap_or_default()
+}
+
+/// The enabled plugins' `plugin.json` texts, for their hooks.
+pub fn plugin_hook_files(cwd: &Path) -> Vec<(PathBuf, String)> {
+    plugin_dirs(cwd)
+        .into_iter()
+        .filter_map(|d| {
+            let p = d.join("plugin.json");
+            fs::read_to_string(&p).ok().map(|t| (p, t))
+        })
+        .collect()
+}
+
 fn command_dirs(cwd: &Path) -> Vec<(PathBuf, bool)> {
     let mut dirs = vec![(commands_dir(), false)];
     if let Some(u) = user_home() {
         dirs.push((u.join(".claude").join("commands"), false));
+    }
+    for p in plugin_dirs(cwd) {
+        dirs.push((p.join("commands"), false));
     }
     if project_extensions_trusted(cwd) {
         dirs.extend(project_command_dirs(cwd).map(|d| (d, true)));
@@ -2386,6 +2455,9 @@ pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDef> {
     let mut dirs = vec![(home().join("agents"), false)];
     if let Some(u) = user_home() {
         dirs.push((u.join(".claude").join("agents"), false));
+    }
+    for p in plugin_dirs(cwd) {
+        dirs.push((p.join("agents"), false));
     }
     if project_extensions_trusted(cwd) {
         dirs.extend(project_agent_dirs(cwd).map(|d| (d, true)));
@@ -3417,6 +3489,25 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
         return (load, untrusted);
     }
 
+    // Plugins (roadmap 4.6): each enabled one's MCP servers join the
+    // settings' own, which win on a name both define.
+    if let Some(plugins) = merged.get("plugins").and_then(|v| v.as_object()).cloned() {
+        for dir in plugin_dirs_from(&plugins) {
+            let Some(servers) = read_plugin_json(&dir)
+                .and_then(|v| v.get("mcp_servers").and_then(|m| m.as_object()).cloned())
+            else {
+                continue;
+            };
+            let entry = merged
+                .entry("mcp_servers".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(m) = entry.as_object_mut() {
+                for (k, v) in servers {
+                    m.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
     let load = match serde_json::from_value(serde_json::Value::Object(merged)) {
         Ok(s) => SettingsLoad {
             settings: Some(s),

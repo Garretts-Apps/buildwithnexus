@@ -902,6 +902,7 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
     }
     tools::set_repo_map(opts.repo_map.unwrap_or(settings.repo_map));
+    provider::set_fallback_model(settings.fallback_model.clone());
     agent::set_compaction(
         settings
             .compaction

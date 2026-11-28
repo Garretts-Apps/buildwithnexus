@@ -7,6 +7,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Plugins.** `"plugins": {"kit": true}` loads `~/.buildwithnexus/plugins/kit`
+  as one unit: its `commands/`, `skills/` and `agents/` folders, and the
+  `hooks` and `mcp_servers` in its `plugin.json`. `{"path": "~/my-kit"}`
+  names another folder; `"enabled": false` turns it off. A project file's
+  `plugins` waits for trust, like its hooks.
+- **`fallback_model`.** A model on the same endpoint tried once when the
+  session's is rate-limited or overloaded past its retries; the run says
+  so. Under `max_budget_usd`, never a model with no known price.
 - **An agent file can name its model.** `model: small-model` in an agent
   file's frontmatter runs that helper on that model, at the session's
   endpoint; `inherit` or no line keeps the session's.

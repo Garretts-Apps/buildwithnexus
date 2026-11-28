@@ -13002,3 +13002,118 @@ fn an_agent_files_model_runs_that_helper() {
         "{models:?}"
     );
 }
+
+// Roadmap 4.6: with `fallback_model`, a request the session's model can't
+// serve (overloaded past its retries) is tried once on the fallback, at
+// the same endpoint, and the run goes on; the run says so.
+#[test]
+fn a_busy_model_falls_back_to_the_fallback_model() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let models = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&models);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (method, body) = read_request(&mut stream);
+            let (status, reply) = if method != "POST" {
+                (200, r#"{"object":"list","data":[]}"#.to_string())
+            } else {
+                let model = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["model"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(model.clone());
+                if model == "small-model" {
+                    (200, finish("answered by the fallback"))
+                } else {
+                    (500, r#"{"error":{"message":"overloaded"}}"#.to_string())
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "custom", "model": "gw-model", "permission": "readonly",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "fallback_model": "small-model",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "say hi");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let models = models.lock().unwrap().clone();
+    assert_eq!(
+        models.last().map(String::as_str),
+        Some("small-model"),
+        "{models:?}"
+    );
+    assert!(models.iter().filter(|m| *m == "gw-model").count() >= 1);
+    assert!(
+        r.text_of("notice").contains("trying small-model"),
+        "{}",
+        r.text_of("notice")
+    );
+}
+
+// Roadmap 4.6 (plugins as one unit): an enabled plugin's agent files and
+// hooks load together; switched off, none of it does.
+#[cfg(unix)]
+#[test]
+fn a_plugin_loads_its_agents_and_hooks_as_one_unit() {
+    for enabled in [true, false] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let kit = home.join("plugins/kit");
+        std::fs::create_dir_all(kit.join("agents")).unwrap();
+        std::fs::write(
+            kit.join("agents/kit-scout.md"),
+            "---\nname: kit-scout\ndescription: From the kit\n---\nLook.\n",
+        )
+        .unwrap();
+        let marker = cwd.join("hook-ran");
+        std::fs::write(
+            kit.join("plugin.json"),
+            json!({"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": format!("touch '{}'", marker.display())}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let port = serve(vec![
+            tool_call("c1", "task", json!({"task": "look", "role": "kit-scout"})),
+            finish("looked"),
+            finish("done"),
+        ]);
+        write_big_context_config(&home, port);
+        add_user_setting(
+            &home,
+            "plugins",
+            json!({"kit": if enabled { json!(true) } else { json!({"enabled": false}) }}),
+        );
+        let r = run(&home, &cwd, "use the kit");
+        assert_eq!(
+            marker.exists(),
+            enabled,
+            "hook, enabled={enabled}: {}",
+            r.stderr
+        );
+        // The plugin's agent file is a role only while the plugin is on.
+        let unknown = r
+            .text_of("tool_result")
+            .contains("unknown role 'kit-scout'");
+        assert_eq!(
+            unknown,
+            !enabled,
+            "role, enabled={enabled}: {}",
+            r.text_of("tool_result")
+        );
+    }
+}

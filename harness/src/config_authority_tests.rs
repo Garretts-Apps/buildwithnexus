@@ -329,6 +329,13 @@ const KEYS: &[Key] = &[
         user: &[r#"{"threshold_percent":60,"keep_recent":10}"#, "{}", "5"],
         project: &[r#"{"threshold_percent":20}"#, "5"],
     },
+    // What the user pays for: like `model`, a project needs trust.
+    Key {
+        name: "fallback_model",
+        class: Class::Trust,
+        user: &[r#""small-model""#, "5"],
+        project: &[r#""expensive-model""#, "5"],
+    },
     Key {
         name: "sandbox_expose",
         class: Class::Trust,
