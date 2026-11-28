@@ -81,6 +81,7 @@ pub mod sandbox;
 pub mod screenshot;
 pub mod seal;
 pub mod session;
+pub mod signed_in;
 pub mod sixel;
 mod system_prompt;
 pub mod tools;

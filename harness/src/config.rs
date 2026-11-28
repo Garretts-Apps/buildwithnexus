@@ -565,6 +565,10 @@ pub struct Settings {
     /// name → {"command", "args", "extensions", "wait_ms"}.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lsp: BTreeMap<String, serde_json::Value>,
+    /// A browser with the user's signed-in session (roadmap 5.9):
+    /// `{"profile": "<folder>", "hosts": ["github.com"]}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in_browser: Option<serde_json::Value>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -708,6 +712,7 @@ impl Default for Settings {
             compaction: None,
             fallback_model: None,
             lsp: BTreeMap::new(),
+            signed_in_browser: None,
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),

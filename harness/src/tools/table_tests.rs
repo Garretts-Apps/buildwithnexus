@@ -14,10 +14,15 @@ fn table_rows_are_unique_and_match_the_offered_tools() {
     let unique: BTreeSet<&str> = rows.iter().copied().collect();
     assert_eq!(rows.len(), unique.len(), "duplicate table rows");
     // MCP tools, and the resource/prompt tools, appear in `defs` only after
-    // a server publishes them. They stay in the table so a call cannot skip
-    // a gate.
-    let static_name =
-        |n: &str| !crate::mcp::is_mcp_tool(n) && n != "mcp_resources" && n != "mcp_prompts";
+    // a server publishes them, and signed_in_browser only once the user set
+    // it up (roadmap 5.9). They stay in the table so a call cannot skip a
+    // gate.
+    let static_name = |n: &str| {
+        !crate::mcp::is_mcp_tool(n)
+            && n != "mcp_resources"
+            && n != "mcp_prompts"
+            && n != "signed_in_browser"
+    };
     let offered: BTreeSet<&str> = defs(true)
         .iter()
         .map(|d| d.name)

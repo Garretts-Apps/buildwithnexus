@@ -40,6 +40,7 @@ pub(crate) enum Tool {
     ReadServerLog,
     WaitForUrl,
     ScreenshotUrl,
+    SignedInBrowser,
     OpenBrowser,
     ListPythonTools,
     PythonScript,
@@ -325,6 +326,7 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     spec("headless_browser", HeadlessBrowser).network(Url),
     spec("wait_for_url", WaitForUrl).network(Url),
     spec("screenshot_url", ScreenshotUrl).network(HttpUrl),
+    spec("signed_in_browser", SignedInBrowser).network(HttpUrl),
     spec("open_browser", OpenBrowser).mutating().network(Url),
     // Planning, skills, knowledge, control.
     spec("todowrite", TodoWrite)

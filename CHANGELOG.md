@@ -19,6 +19,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **A browser with your signed-in session (roadmap 5.9).**
+  `"signed_in_browser": {"profile": ..., "hosts": [...]}` adds a tool that
+  reads pages on those hosts as you. It runs from a copy of the profile,
+  with scripts off, and reads without clicking anything. Every other host
+  goes to a refusing proxy, so a planted image, script or form reaches
+  nothing and submits nothing. What it reads is labelled untrusted.
 - **A test that keeps failing becomes a proposed regression check (roadmap
   5.4).** After the same cargo, pytest or Go test fails the project's
   checks in three turns, `buildwithnexus rules accept check:<id>` adds a

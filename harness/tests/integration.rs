@@ -13614,3 +13614,94 @@ fn an_experiments_result_is_in_the_evidence_record() {
         "{verified}"
     );
 }
+
+// Roadmap 5.9: a page read with the signed-in browser can't take the
+// session elsewhere or act. Its planted image, script and self-submitting
+// form reach no other server and post nothing; the page's text still
+// reaches the model, labelled untrusted.
+#[cfg(unix)]
+#[test]
+fn invariant_a_signed_in_page_sends_nothing_elsewhere_and_submits_nothing() {
+    use std::io::{BufRead, BufReader, Write};
+    let serve_page = |page: String| {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let s2 = seen.clone();
+        thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                s2.lock().unwrap().push(first.trim().to_string());
+                let mut c = c;
+                let _ = write!(c, "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}", page.len());
+            }
+        });
+        (port, seen)
+    };
+    let (other, other_seen) = serve_page("leak".into());
+    let page = format!(
+        "<html><body><p>PAGE-TEXT for the agent</p>\
+         <img src=\"http://127.0.0.1:{other}/img\">\
+         <form id=f action=\"/submit\" method=post><input name=a value=b></form>\
+         <script>fetch('http://127.0.0.1:{other}/fetch'); document.getElementById('f').submit();</script>\
+         </body></html>"
+    );
+    let (site, site_seen) = serve_page(page);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let profile = home.join("chrome-profile");
+    std::fs::create_dir_all(profile.join("Default")).unwrap();
+    let port = serve(vec![
+        tool_call(
+            "b",
+            "signed_in_browser",
+            json!({"url": format!("http://localhost:{site}/")}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+            "signed_in_browser": {"profile": profile, "hosts": [format!("localhost:{site}")]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "read the page");
+    let result = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "signed_in_browser")
+        .unwrap_or_else(|| panic!("{:?}", r.events));
+    let content = result["content"].as_str().unwrap_or("");
+    if content.contains("no Chrome, Chromium or Edge found") {
+        eprintln!("skipping: no browser installed");
+        return;
+    }
+    assert!(content.contains("PAGE-TEXT"), "{content}");
+    assert!(
+        content.starts_with("[untrusted content from signed_in_browser"),
+        "{content}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "reached another server: {:?}",
+        other_seen.lock().unwrap()
+    );
+    let posted: Vec<String> = site_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("POST"))
+        .cloned()
+        .collect();
+    assert!(posted.is_empty(), "a form was submitted: {posted:?}");
+    // The user's own profile is untouched: still only the empty folder.
+    assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 1);
+}
