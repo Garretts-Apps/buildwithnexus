@@ -45,6 +45,7 @@
 
 mod acp;
 pub mod agent;
+pub mod audit;
 pub mod capabilities;
 pub mod checkpoint;
 pub mod config;

@@ -11183,3 +11183,93 @@ fn invariant_ih2_an_unreadable_inherited_policy_is_the_strictest() {
     );
     assert!(!cwd.join("x.txt").exists());
 }
+
+// ── decision log (roadmap 2.5, AC-1) ───────────────────────────────────────
+
+// AC-1: a scripted session with allows, a refusal and the posture
+// acceptance writes a decision log. The separate verifier, given only the
+// log, lists every decision with its actor, time and subject and finds the
+// chain intact; it reports an edited line, a deleted line and a log that
+// stops short of a recorded head.
+#[test]
+fn invariant_ac1_the_decision_log_lists_every_decision_and_catches_tampering() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call("c1", "write_file", json!({"path": "a.txt", "content": "x"})),
+        tool_call("c2", "run_command", json!({"command": "echo hi"})),
+        tool_call("c3", "read_file", json!({"path": "server.pem"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    // The refused read makes the run exit non-zero; that is part of it.
+    let _ = run(&home, &cwd, "do three things");
+    let dir = home.join("audit");
+    let log = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("no audit folder {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("a session log");
+    let verify = |p: &Path, extra: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_bwn-audit-verify"))
+            .arg(p)
+            .args(extra)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let (code, out) = verify(&log, &[]);
+    assert_eq!(code, Some(0), "{out}");
+    for want in [
+        "posture",
+        "write_file",
+        "run_command",
+        "echo hi",
+        "read_file",
+        "deny",
+        "allow",
+        "gate",
+    ] {
+        assert!(out.contains(want), "missing {want}:\n{out}");
+    }
+    // The head the verifier reports, recorded elsewhere, holds.
+    let head = out
+        .lines()
+        .last()
+        .and_then(|l| l.rsplit("head ").next())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(verify(&log, &["--head", &head]).0, Some(0));
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() >= 4, "{text}");
+    let write_as = |name: &str, body: String| {
+        let p = dir.join(log.file_name().unwrap());
+        let alt = dir.join(name);
+        std::fs::create_dir_all(&alt).unwrap();
+        let q = alt.join(p.file_name().unwrap());
+        std::fs::write(&q, body).unwrap();
+        q
+    };
+    // An edited line: a refusal turned into an allow.
+    let edited = text.replacen("\"decision\":\"deny\"", "\"decision\":\"allow\"", 1);
+    assert_ne!(edited, text, "the session had a refusal to edit");
+    let (code, out) = verify(&write_as("edited", edited), &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("BROKEN"), "{out}");
+    // A deleted line.
+    let mut cut: Vec<&str> = lines.clone();
+    cut.remove(1);
+    let (code, out) = verify(&write_as("deleted", cut.join("\n") + "\n"), &[]);
+    assert_eq!(code, Some(1), "{out}");
+    // Cut short at the end: only a recorded head shows it.
+    let short = lines[..lines.len() - 1].join("\n") + "\n";
+    let shortp = write_as("short", short);
+    assert_eq!(verify(&shortp, &[]).0, Some(0));
+    assert_eq!(verify(&shortp, &["--head", &head]).0, Some(1));
+}

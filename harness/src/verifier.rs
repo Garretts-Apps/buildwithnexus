@@ -130,7 +130,29 @@ impl Verifier {
     }
 
     /// Main entry point: verifies the task context and returns a comprehensive report.
+    /// The result goes in the decision log (roadmap 2.5).
     pub fn verify(&self, ctx: &VerificationContext) -> VerificationReport {
+        let report = self.verify_inner(ctx);
+        let decision = match report.status {
+            VerificationStatus::Passed | VerificationStatus::PassedWithWarnings => "pass",
+            VerificationStatus::Blocked | VerificationStatus::Failed => "fail",
+        };
+        let rules: Vec<String> = report
+            .rule_violations
+            .iter()
+            .map(|v| v.rule_id.clone())
+            .collect();
+        crate::audit::record(crate::audit::Entry {
+            kind: crate::audit::Kind::Verify,
+            actor: "check",
+            decision,
+            subject: "verifier",
+            detail: &format!("{:?}; rules: {}", report.status, rules.join(", ")),
+        });
+        report
+    }
+
+    fn verify_inner(&self, ctx: &VerificationContext) -> VerificationReport {
         // 1. Build EvaluationContext for RuleEngine
         let tools_called: Vec<String> =
             ctx.tool_calls.iter().map(|c| c.tool_name.clone()).collect();

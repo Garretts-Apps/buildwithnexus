@@ -26,6 +26,13 @@ name = "buildwithnexus"
 path = "src/main.rs"
 
 [[bin]]
+name = "bwn-audit-verify"
+path = "src/audit_verify.rs"
+# Shares no code with the writer (src/audit.rs) on purpose: a bug the two
+# shared would verify itself (roadmap 2.5, AC-1).
+doc = false
+
+[[bin]]
 name = "bwn"
 path = "src/bwn.rs"
 # The alias shim collides with the bwn crate's bin in workspace `cargo doc`

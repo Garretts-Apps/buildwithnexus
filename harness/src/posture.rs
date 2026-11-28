@@ -845,6 +845,19 @@ pub fn ensure(
     let session_fp = session_fingerprint(&rows);
     let lines = render(&rows);
     let accept = |why: &str| {
+        crate::audit::record(crate::audit::Entry {
+            kind: crate::audit::Kind::Posture,
+            actor: if why.starts_with("by --accept-posture") {
+                "flag"
+            } else if why.starts_with("earlier") {
+                "policy"
+            } else {
+                "user"
+            },
+            decision: "accept",
+            subject: "posture",
+            detail: &format!("{why}; fingerprint {}", &fp[..fp.len().min(16)]),
+        });
         store(sid, &fp);
         *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Accepted {
             sid: sid.to_string(),
@@ -878,7 +891,25 @@ pub fn ensure(
     if accepted_by_flag() {
         return accept("by --accept-posture");
     }
-    match ask(&lines) {
+    let answer = ask(&lines);
+    if !matches!(answer, Answer::Accept) {
+        crate::audit::record(crate::audit::Entry {
+            kind: crate::audit::Kind::Posture,
+            actor: if matches!(answer, Answer::NoOne) {
+                "policy"
+            } else {
+                "user"
+            },
+            decision: "stop",
+            subject: "posture",
+            detail: if matches!(answer, Answer::NoOne) {
+                "no one to accept it"
+            } else {
+                "stopped at the posture check"
+            },
+        });
+    }
+    match answer {
         Answer::Accept => accept("for this session"),
         Answer::Stop => Err(
             "stopped at the posture check: change the firewall, network or settings above, then run again"
