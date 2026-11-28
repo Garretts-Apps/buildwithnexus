@@ -141,7 +141,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
     let mode = crate::agent::permission_name(perm);
     let (desc, level) = match perm {
         P::Auto => (
-            "runs commands, edits and fetches without asking; asks again once it reads web or MCP content",
+            "runs commands, edits and fetches without asking; after reading web or MCP content asks again, and after reading any text asks before fetches and CI or hook edits",
             Level::Warn,
         ),
         P::AcceptEdits => ("edits files without asking; asks before commands and fetches", Level::Good),

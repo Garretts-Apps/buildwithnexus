@@ -673,6 +673,7 @@ fn tool_result(id: &str, content: &str) -> ToolResult {
         content: content.into(),
         is_error: false,
         images: Vec::new(),
+        source: None,
     }
 }
 
@@ -1028,6 +1029,7 @@ fn anthropic_body_tool_results() {
         content: "ok".into(),
         is_error: false,
         images: Vec::new(),
+        source: None,
     }])];
     let b = anthropic_body("m", &msgs, &[], None);
     let block = &b["messages"][0]["content"][0];
@@ -1055,12 +1057,14 @@ fn image_round() -> Vec<Msg> {
                 content: "image a.png".into(),
                 is_error: false,
                 images: vec![("image/png".into(), "QUJD".into())],
+                source: None,
             },
             ToolResult {
                 id: "c2".into(),
                 content: "hello".into(),
                 is_error: false,
                 images: Vec::new(),
+                source: None,
             },
         ]),
     ]
@@ -1432,12 +1436,14 @@ fn openai_body_tool_results_each_become_a_message() {
             content: "1".into(),
             is_error: false,
             images: Vec::new(),
+            source: None,
         },
         ToolResult {
             id: "b".into(),
             content: "2".into(),
             is_error: true,
             images: Vec::new(),
+            source: None,
         },
     ])];
     let b = openai_body("m", &msgs, &[], None, None);
@@ -2162,12 +2168,14 @@ fn ollama_body_tool_results_carry_tool_name_when_resolvable() {
                 content: "ok".into(),
                 is_error: false,
                 images: Vec::new(),
+                source: None,
             },
             ToolResult {
                 id: "unknown".into(),
                 content: "?".into(),
                 is_error: true,
                 images: Vec::new(),
+                source: None,
             },
         ]),
     ];
@@ -2798,6 +2806,7 @@ fn anthropic_effort_replays_recorded_thinking_before_tool_use() {
             content: "ok".into(),
             is_error: false,
             images: Vec::new(),
+            source: None,
         }]),
     ];
     let body = anthropic_effort_body("claude-opus-4-6", &msgs, &[], None, Effort::Low);

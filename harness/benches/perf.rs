@@ -63,6 +63,7 @@ fn session(turns: usize, result_bytes: usize, image_bytes: usize) -> Vec<Msg> {
             content: source_line.repeat(result_bytes / source_line.len() + 1),
             is_error: false,
             images,
+            source: None,
         }]));
         msgs.push(Msg::Assistant {
             text: format!(
@@ -562,6 +563,7 @@ fn session_round(i: usize) -> [Msg; 2] {
             content: format!("    let value_{i} = compute(input, {i})?; // line\n").repeat(500),
             is_error: false,
             images: Vec::new(),
+            source: None,
         }]),
     ]
 }

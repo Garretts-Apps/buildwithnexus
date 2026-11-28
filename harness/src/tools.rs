@@ -26,6 +26,8 @@ pub struct Outcome {
     /// Images for the model, `(media_type, base64)`. The agent drops them,
     /// and says why, for a model that does not take images.
     pub images: Vec<(String, String)>,
+    /// Where the text came from (roadmap 5.1), set by `run`.
+    pub source: Option<crate::provider::Source>,
 }
 
 fn ok(s: impl Into<String>) -> Outcome {
@@ -34,6 +36,7 @@ fn ok(s: impl Into<String>) -> Outcome {
         is_error: false,
         finished: false,
         images: Vec::new(),
+        source: None,
     }
 }
 fn err(s: impl Into<String>) -> Outcome {
@@ -42,6 +45,7 @@ fn err(s: impl Into<String>) -> Outcome {
         is_error: true,
         finished: false,
         images: Vec::new(),
+        source: None,
     }
 }
 
@@ -4350,6 +4354,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
             is_error: true,
             finished: false,
             images: Vec::new(),
+            source: None,
         };
     }
     let code = cap.code.unwrap_or(-1);
@@ -4374,6 +4379,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         is_error: code != 0,
         finished: false,
         images: Vec::new(),
+        source: None,
     }
 }
 
@@ -4759,6 +4765,7 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Out
                 is_error: true,
                 finished: false,
                 images: Vec::new(),
+                source: None,
             };
         }
     }
@@ -5148,6 +5155,7 @@ fn run_checks(checks: &[WorkCheck], cwd: &Path, required: bool) -> Outcome {
         is_error: any_fail,
         finished: false,
         images: Vec::new(),
+        source: None,
     }
 }
 
@@ -5667,16 +5675,26 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     let rewritten = crate::workspace::rewrite(name, input, cwd);
     let input = rewritten.as_ref().unwrap_or(input);
     let watch = crate::debug_panel::tool_start(name, input, cwd);
+    let reached = crate::egress::reached();
     let mut outcome = run_tool(name, input, cwd);
-    // Text from the web or an MCP server is someone else's: the model is
-    // told so, and auto mode asks from now on (agent::gate).
-    if reads_untrusted(name) && !outcome.is_error {
-        crate::agent::mark_untrusted_read(name);
-        // A server's prompt template is meant to be followed: it marks the
-        // session, but is not labelled as data.
-        if name != "mcp_prompts" {
-            outcome.content = untrusted_label(name, &outcome.content);
+    // Where the text came from (roadmap 5.1). Someone else's (the web, an
+    // MCP server, a dependency, a file outside the workspace, a command that
+    // reached the network): the model is told so, and auto mode asks before
+    // commands, fetches and MCP calls from now on. The project's own: auto
+    // mode asks before fetches, MCP writes and edits of CI, hook or policy
+    // files (agent::gate).
+    outcome.source = source_of(name, input, cwd, &outcome, reached);
+    match &outcome.source {
+        Some(crate::provider::Source::External(via)) => {
+            crate::agent::mark_untrusted_read(via);
+            // A server's prompt template is meant to be followed: it marks
+            // the session, but is not labelled as data.
+            if name != "mcp_prompts" {
+                outcome.content = untrusted_label(via, &outcome.content);
+            }
         }
+        Some(crate::provider::Source::Workspace(via)) => crate::agent::mark_local_read(via),
+        None => {}
     }
     crate::debug_panel::tool_end(watch, name, input, cwd, &outcome.content, outcome.is_error);
     if crate::workspace::armed() {
@@ -5694,6 +5712,165 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         }
     }
     outcome
+}
+
+/// CI, hook and policy files (roadmap 5.1): what a planted instruction
+/// would rewrite to run later, or to loosen the rules. Relative to a
+/// workspace root.
+pub const PROTECTED_PATHS: &[&str] = &[
+    ".github",
+    ".gitlab-ci.yml",
+    ".circleci",
+    "azure-pipelines.yml",
+    "Jenkinsfile",
+    ".buildkite",
+    ".husky",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    ".lefthook.yml",
+    ".envrc",
+    ".git",
+    ".buildwithnexus",
+];
+
+/// Whether `p` is one of the `PROTECTED_PATHS` (or inside one) of the
+/// workspace at `cwd` or an added folder.
+pub fn is_protected_path(p: &Path, cwd: &Path) -> bool {
+    let canon = |q: &Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
+    // The path may not exist yet: resolve the folder it would be made in.
+    let full = match (p.parent(), p.file_name()) {
+        (Some(dir), Some(f)) if !p.exists() => canon(dir).join(f),
+        _ => canon(p),
+    };
+    std::iter::once(cwd.to_path_buf())
+        .chain(crate::workdirs::list())
+        .any(|root| {
+            full.strip_prefix(canon(&root))
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .is_some_and(|c| {
+                    PROTECTED_PATHS.contains(&c.as_os_str().to_string_lossy().as_ref())
+                })
+        })
+}
+
+/// Whether a command's text names a protected path (`> .github/x.yml`,
+/// `cp x .husky/pre-commit`). The sandbox also keeps the existing ones
+/// read-only; this catches a new file it can't.
+pub fn command_names_protected_path(cmd: &str, cwd: &Path) -> bool {
+    cmd.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '|' | '&' | '(' | ')' | '`')
+    })
+    .map(|t| t.trim_start_matches(['>', '<', '=']))
+    .filter(|t| !t.is_empty())
+    .any(|t| {
+        let t = t.strip_prefix("./").unwrap_or(t);
+        let first = t.split('/').next().unwrap_or(t);
+        PROTECTED_PATHS.contains(&first) || is_protected_path(&resolve(cwd, t), cwd)
+    })
+}
+
+/// Folders that hold other people's code: packages, vendored copies,
+/// virtual environments and toolchain caches.
+const DEPENDENCY_DIRS: &[&str] = &[
+    "node_modules",
+    "bower_components",
+    "vendor",
+    "site-packages",
+    "dist-packages",
+    ".venv",
+    "venv",
+    ".tox",
+    ".cargo",
+    ".rustup",
+    ".gradle",
+    ".m2",
+    "Pods",
+    ".bundle",
+    "go",
+];
+
+/// Whether `p` lies in a dependency folder (`DEPENDENCY_DIRS`; `go` only
+/// as `go/pkg/mod`).
+pub fn is_dependency_path(p: &Path) -> bool {
+    let parts: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.iter().enumerate().any(|(i, c)| {
+        if c == "go" {
+            parts.get(i + 1).is_some_and(|n| n == "pkg")
+                && parts.get(i + 2).is_some_and(|n| n == "mod")
+        } else {
+            DEPENDENCY_DIRS.contains(&c.as_str())
+        }
+    })
+}
+
+// Whether `p` is inside the workspace (the folder or an added one).
+fn in_workspace(p: &Path, cwd: &Path) -> bool {
+    let canon = |q: &Path| q.canonicalize().unwrap_or_else(|_| q.to_path_buf());
+    let p = canon(p);
+    std::iter::once(cwd.to_path_buf())
+        .chain(crate::workdirs::list())
+        .any(|r| p.starts_with(canon(&r)))
+}
+
+/// Where a tool's result text came from (roadmap 5.1): None for a tool
+/// that reports only on its own work (an edit, a todo list).
+fn source_of(
+    name: &str,
+    input: &Value,
+    cwd: &Path,
+    outcome: &Outcome,
+    reached_before: u64,
+) -> Option<crate::provider::Source> {
+    use crate::provider::Source;
+    if reads_untrusted(name) {
+        return (!outcome.is_error).then(|| Source::External(name.to_string()));
+    }
+    let tool = table::lookup(name)?.tool;
+    match tool {
+        // An error is bwn's own report, not the file's text.
+        table::Tool::ReadFile | table::Tool::ReadManyFiles | table::Tool::GrepFiles
+            if outcome.is_error =>
+        {
+            None
+        }
+        table::Tool::ReadFile | table::Tool::ReadManyFiles | table::Tool::GrepFiles => {
+            let mut paths = touched_paths(name, input, cwd);
+            if tool == table::Tool::GrepFiles {
+                // A search names the files it matched at the start of each
+                // line.
+                paths.extend(outcome.content.lines().filter_map(|l| {
+                    let f = l.split(':').next()?.trim();
+                    (!f.is_empty() && !f.contains(' ')).then(|| resolve(cwd, f))
+                }));
+            }
+            if paths
+                .iter()
+                .any(|p| is_dependency_path(p.strip_prefix(cwd).unwrap_or(p)))
+            {
+                Some(Source::External(format!("{name} (a dependency's file)")))
+            } else if paths.iter().any(|p| !in_workspace(p, cwd)) {
+                Some(Source::External(format!(
+                    "{name} (a file outside the workspace)"
+                )))
+            } else {
+                Some(Source::Workspace(name.to_string()))
+            }
+        }
+        table::Tool::RunCommand | table::Tool::PythonScript | table::Tool::ReadServerLog => {
+            if crate::egress::reached() > reached_before {
+                Some(Source::External(format!(
+                    "{name} (a command that reached the network)"
+                )))
+            } else {
+                Some(Source::Workspace(name.to_string()))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Tools whose results are text someone outside the session wrote: web
@@ -6604,6 +6781,7 @@ fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
             is_error: false,
             finished: true,
             images: Vec::new(),
+            source: None,
         },
         T::ExitPlan => {
             if let Some(steps) = input["steps"].as_array() {
@@ -7077,3 +7255,122 @@ mod read_view_tests;
 mod table_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::provider::Source;
+    use serde_json::json;
+
+    fn done(content: &str) -> Outcome {
+        let mut o = ok(content);
+        o.is_error = false;
+        o
+    }
+
+    // Roadmap 5.1: a command's output is the project's own while it stays on
+    // this machine, and someone else's once the command reached the network
+    // through the proxy; files are sorted by where they lie.
+    #[test]
+    fn each_result_is_labelled_with_where_its_text_came_from() {
+        let cwd = std::env::temp_dir().join(format!("bwn-src-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join("vendor/x")).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let cmd = json!({"command": "make"});
+        let before = crate::egress::reached();
+        assert_eq!(
+            source_of("run_command", &cmd, &cwd, &done("built"), before),
+            Some(Source::Workspace("run_command".into()))
+        );
+        crate::egress::note_reached_for_test();
+        assert!(matches!(
+            source_of("run_command", &cmd, &cwd, &done("fetched"), before),
+            Some(Source::External(v)) if v.contains("reached the network")
+        ));
+        let read = |p: &str| {
+            source_of(
+                "read_file",
+                &json!({"path": p}),
+                &cwd,
+                &done("t"),
+                crate::egress::reached(),
+            )
+        };
+        assert_eq!(
+            read("src/a.rs"),
+            Some(Source::Workspace("read_file".into()))
+        );
+        assert!(
+            matches!(read("vendor/x/README"), Some(Source::External(v)) if v.contains("dependency"))
+        );
+        assert!(
+            matches!(read("/etc/hosts"), Some(Source::External(v)) if v.contains("outside the workspace"))
+        );
+        // A search that matched a dependency's file.
+        assert!(matches!(
+            source_of(
+                "grep",
+                &json!({"pattern": "x"}),
+                &cwd,
+                &done("node_modules/a/i.js:1:x"),
+                crate::egress::reached()
+            ),
+            Some(Source::External(_))
+        ));
+        assert_eq!(
+            source_of("write_file", &json!({"path": "a"}), &cwd, &done("wrote"), 0),
+            None
+        );
+        assert!(matches!(
+            source_of("fetch_url", &json!({}), &cwd, &done("page"), 0),
+            Some(Source::External(_))
+        ));
+        let mut failed = done("no such file");
+        failed.is_error = true;
+        assert_eq!(read_err(&cwd, &failed), None);
+        for (p, dep) in [
+            ("go/pkg/mod/x", true),
+            ("go/src/x", false),
+            ("a/node_modules/b", true),
+            ("src/vendorish", false),
+        ] {
+            assert_eq!(is_dependency_path(Path::new(p)), dep, "{p}");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn read_err(cwd: &Path, o: &Outcome) -> Option<Source> {
+        source_of("read_file", &json!({"path": "missing"}), cwd, o, 0)
+    }
+
+    #[test]
+    fn protected_paths_are_found_in_file_paths_and_commands() {
+        let cwd = std::env::temp_dir().join(format!("bwn-prot-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join(".github")).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        for p in [
+            ".github/workflows/ci.yml",
+            ".husky/pre-commit",
+            ".envrc",
+            "Jenkinsfile",
+            ".buildwithnexus/settings.json",
+        ] {
+            assert!(is_protected_path(&cwd.join(p), &cwd), "{p}");
+        }
+        for p in ["src/github.rs", "docs/.github-notes", "a/.github/x"] {
+            assert!(!is_protected_path(&cwd.join(p), &cwd), "{p}");
+        }
+        for c in [
+            "echo x >> .github/workflows/ci.yml",
+            "cp a ./.husky/pre-commit",
+            "tee .pre-commit-config.yaml",
+            "sed -i s/a/b/ 'Jenkinsfile'",
+        ] {
+            assert!(command_names_protected_path(c, &cwd), "{c}");
+        }
+        for c in ["make build", "cargo test", "cat README.md"] {
+            assert!(!command_names_protected_path(c, &cwd), "{c}");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+}

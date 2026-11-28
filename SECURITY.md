@@ -736,10 +736,30 @@ session can reach: the permission and sandbox modes, the added folders, which
 credential stores are hidden, and the hosts `network.allow` names. If any of
 these changes in the session (`/permissions`, `/sandbox`, `/add-dir`, a typed
 switch, an edited settings file), the check asks again before the next model
-request. Text from web pages, search results
-and MCP servers is labelled as untrusted for the model, and after a session
-reads any, auto mode asks before commands, fetches and MCP calls that can
-change things.
+request.
+
+Every tool result carries its source (roadmap 5.1), kept in the session
+file and through compaction, so a resumed session knows what it read:
+- **Someone else's text:** web pages, search results, MCP servers' output,
+  files in a dependency folder (`node_modules`, `vendor`, `site-packages`,
+  `.venv`, `go/pkg/mod`, …) or outside the workspace, and the output of a
+  command that reached the network through the checker. It is labelled as
+  untrusted for the model. After a session reads any, auto mode asks
+  before commands, fetches and MCP calls that can change things.
+- **The project's own text:** its files, and the output of commands that
+  stayed on this machine. A code comment can carry a planted instruction
+  too. After a session reads any, auto mode asks before a fetch to a host
+  you didn't name (this machine's own servers excepted) and before MCP
+  calls that can change things. Sandboxed commands carry on.
+- **CI, hook and policy files:** after either kind of read, auto mode asks
+  before an edit of one, whether through a file tool or a command that
+  names it. The files are `.github`, `.gitlab-ci.yml`, `.circleci`,
+  `azure-pipelines.yml`, `Jenkinsfile`, `.buildkite`, `.husky`,
+  `.pre-commit-config.yaml`, `lefthook.yml`, `.envrc`, `.git` and
+  `.buildwithnexus`. The sandbox (bubblewrap, the namespace backend and
+  Seatbelt) makes those that exist read-only to commands. A new one made
+  by a command that doesn't name it is caught only when the turn's
+  changes are checked.
 
 ### What the automatic checks do not guarantee
 

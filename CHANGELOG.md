@@ -7,6 +7,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Every tool result names its source, and auto mode acts on it (roadmap
+  5.1).** Each result is labelled with where its text came from, and the
+  label survives resume and compaction.
+  - **Someone else's text:** web, search and MCP results, files in
+    dependency folders or outside the workspace, and the output of a
+    command that reached the network. It is labelled as untrusted for the
+    model. Auto mode then asks before commands, fetches and MCP calls.
+  - **The project's own text:** files and offline command output. Auto
+    mode asks before a fetch to a host you didn't name (this machine's own
+    servers excepted) and before MCP writes. Sandboxed commands run.
+  - **CI, hook and policy files:** after either kind of read, an edit of
+    one asks, by file tool or by a command that names it. The sandbox
+    keeps the existing files read-only to commands.
 - **Azure OpenAI (Foundry), with its key bound to Azure (roadmap 4.4).**
   `"provider": "azure"` with your resource's v1 endpoint as `base_url`
   sends `AZURE_OPENAI_API_KEY` in the `api-key` header, and only to a host

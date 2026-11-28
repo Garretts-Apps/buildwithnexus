@@ -65,6 +65,7 @@ fn result(id: &str, content: &str, is_error: bool, images: &[(&str, &str)]) -> T
             .iter()
             .map(|(m, d)| (m.to_string(), d.to_string()))
             .collect(),
+        source: None,
     }
 }
 

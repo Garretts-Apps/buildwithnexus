@@ -360,6 +360,7 @@ pub(super) fn draft_plan(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -390,6 +391,7 @@ pub(super) fn draft_plan(
                         content,
                         is_error: true,
                         images: Vec::new(),
+                        source: None,
                     });
                     let fallback = fallback_exit_plan_input(task);
                     report::tool_call(
@@ -434,6 +436,7 @@ pub(super) fn draft_plan(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -463,6 +466,7 @@ pub(super) fn draft_plan(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -477,6 +481,7 @@ pub(super) fn draft_plan(
                         content: msg,
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -498,6 +503,7 @@ pub(super) fn draft_plan(
                 content: out.content,
                 is_error: out.is_error,
                 images: out.images,
+                source: out.source,
             });
         }
         msgs.push(Msg::Assistant {

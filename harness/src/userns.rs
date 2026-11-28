@@ -456,6 +456,33 @@ pub(crate) mod tests {
         );
     }
 
+    // Roadmap 5.1: once an auto-mode session has read text that could carry
+    // a planted instruction, a command can't rewrite the workflow or hook
+    // files that exist; the rest of the workspace stays writable.
+    #[test]
+    fn invariant_so8_a_tainted_auto_session_cannot_rewrite_ci_by_command() {
+        let Some(c) = Cell::new("so8") else { return };
+        std::fs::create_dir_all(c.ws.join(".github/workflows")).unwrap();
+        std::fs::write(c.ws.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        crate::agent::clear_untrusted_read();
+        crate::sandbox::TEST_AUTO.with(|a| a.set(Some(true)));
+        crate::agent::mark_local_read("read_file");
+        let (_, said) = c.run(
+            "echo evil >> .github/workflows/ci.yml 2>/dev/null && echo CI-WROTE; touch .github/new.yml 2>/dev/null && echo CI-MADE; echo ok > rel.txt && echo REL-OK",
+        );
+        crate::sandbox::TEST_AUTO.with(|a| a.set(None));
+        crate::agent::clear_untrusted_read();
+        assert!(
+            !said.contains("CI-WROTE") && !said.contains("CI-MADE"),
+            "{said}"
+        );
+        assert!(said.contains("REL-OK"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(c.ws.join(".github/workflows/ci.yml")).unwrap(),
+            "on: push\n"
+        );
+    }
+
     // The command must not undo the mounts: no capabilities after exec (even
     // when bwn runs as root), and the mount syscalls are refused.
     #[test]

@@ -901,12 +901,16 @@ fn phase_readonly_reason(reason: String, phase_msg: &str) -> String {
 struct Untrusted {
     sid: String,
     tool: Option<String>,
+    /// The tool through which the session first read the project's own
+    /// text (roadmap 5.1's workspace tier).
+    local: Option<String>,
 }
 
 #[cfg(not(test))]
 static UNTRUSTED: std::sync::Mutex<Untrusted> = std::sync::Mutex::new(Untrusted {
     sid: String::new(),
     tool: None,
+    local: None,
 });
 
 fn with_untrusted<T>(f: impl FnOnce(&mut Untrusted) -> T) -> T {
@@ -931,6 +935,21 @@ pub fn mark_untrusted_read(tool: &str) {
     with_untrusted(|u| {
         u.tool.get_or_insert_with(|| tool.to_string());
     });
+}
+
+/// The session read the project's own text (a file, a command's output
+/// that stayed on this machine) through `tool`. It may hold a planted
+/// instruction too (roadmap 5.1): from here on auto mode asks before
+/// fetches, MCP writes and edits of CI, hook or policy files.
+pub fn mark_local_read(tool: &str) {
+    with_untrusted(|u| {
+        u.local.get_or_insert_with(|| tool.to_string());
+    });
+}
+
+/// The tool through which this session first read the project's own text.
+pub fn local_read() -> Option<String> {
+    with_untrusted(|u| u.local.clone())
 }
 
 /// The tool through which this session first read untrusted text, if any.
@@ -967,7 +986,25 @@ pub fn sync_untrusted(sid: &str, msgs: &[Msg]) {
         }
         u.sid = sid.to_string();
         u.tool = untrusted_tool_in(msgs);
+        u.local = local_tool_in(msgs);
     });
+}
+
+/// The tool through which `msgs` first show the project's own text: a
+/// result labelled with that source, or a compaction's note of one.
+pub(crate) fn local_tool_in(msgs: &[Msg]) -> Option<String> {
+    let note = |text: &str| {
+        let rest = text.split_once("[project content from ")?.1;
+        rest.split_once(':').map(|(t, _)| t.to_string())
+    };
+    msgs.iter().find_map(|m| match m {
+        Msg::Tool(results) => results.iter().find_map(|r| match &r.source {
+            Some(crate::provider::Source::Workspace(t)) => Some(t.clone()),
+            _ => note(&r.content),
+        }),
+        Msg::User(text) | Msg::UserImages { text, .. } => note(text),
+        _ => None,
+    })
 }
 
 /// The tool through which `msgs` first show untrusted text: a labelled
@@ -979,7 +1016,10 @@ pub(crate) fn untrusted_tool_in(msgs: &[Msg]) -> Option<String> {
         rest.split_once(':').map(|(t, _)| t.to_string())
     };
     msgs.iter().find_map(|m| match m {
-        Msg::Tool(results) => results.iter().find_map(|r| from(&r.content)),
+        Msg::Tool(results) => results.iter().find_map(|r| match &r.source {
+            Some(crate::provider::Source::External(t)) => Some(t.clone()),
+            _ => from(&r.content),
+        }),
         Msg::User(text) | Msg::UserImages { text, .. } => from(text),
         _ => None,
     })
@@ -1009,10 +1049,63 @@ fn auto_asks(
     let mcp_action =
         (name.starts_with("mcp__") || name == "mcp_call") && tools::is_mutating_call(name, input);
     let reaches_out = host.is_some() || mcp_action;
+    let external = untrusted_read();
+    let local = local_read();
+    // Roadmap 5.1: once the session has read text that could carry a
+    // planted instruction (anyone's, the project's own included), an edit
+    // of a CI, hook or policy file asks, through a file tool or a command.
+    if let Some(tool) = external.as_ref().or(local.as_ref()) {
+        // A call that changes paths without being a command: a file tool's
+        // write, move or removal.
+        let edit = any_cmd.is_none() && tools::is_mutating_call(name, input);
+        let protected = (edit
+            && tools::touched_paths(name, input, cwd)
+                .iter()
+                .any(|p| tools::is_protected_path(p, cwd)))
+            || (command && any_cmd.is_some_and(|c| tools::command_names_protected_path(c, cwd)));
+        if protected {
+            return Some(format!(
+                "auto mode asks: this changes a CI, hook or policy file, and this session read text through {tool} that could carry a planted instruction"
+            ));
+        }
+    }
     if command || reaches_out {
-        if let Some(tool) = untrusted_read() {
+        if let Some(tool) = &external {
             return Some(format!(
                 "auto mode asks: this session read content from {tool} that someone else wrote, and it may carry instructions"
+            ));
+        }
+    }
+    // The project's own text (roadmap 5.1's workspace tier): sandboxed
+    // commands carry on, but what reaches another machine asks, unless the
+    // user named the host.
+    if let Some(tool) = &local {
+        let named = host.is_some_and(|h| {
+            crate::egress::user_hosts()
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(h))
+        });
+        // This machine's own servers (a dev server) aren't another machine.
+        let loopback = host.is_some_and(|h| {
+            let name = match h.parse::<std::net::SocketAddr>() {
+                Ok(a) => return a.ip().is_loopback(),
+                Err(_) => h.rsplit_once(':').map_or(h, |(n, p)| {
+                    if p.bytes().all(|b| b.is_ascii_digit()) {
+                        n
+                    } else {
+                        h
+                    }
+                }),
+            };
+            let name = name.trim_matches(['[', ']']);
+            name.eq_ignore_ascii_case("localhost")
+                || name
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        if (host.is_some() && !named && !loopback) || mcp_action {
+            return Some(format!(
+                "auto mode asks: this reaches another machine, and this session read the project's text through {tool}, which could carry a planted instruction"
             ));
         }
     }
@@ -2642,6 +2735,7 @@ fn build_turn(
                     content: msg,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2671,6 +2765,7 @@ fn build_turn(
                     content: told,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2708,6 +2803,7 @@ fn build_turn(
                     content: answer,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2792,6 +2888,7 @@ fn build_turn(
                     content: reason,
                     is_error: true,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2823,6 +2920,7 @@ fn build_turn(
                         content: msg,
                         is_error: true,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -2840,6 +2938,7 @@ fn build_turn(
                     content: String::new(),
                     is_error: false,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2860,6 +2959,7 @@ fn build_turn(
                         content: String::new(),
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -2871,6 +2971,7 @@ fn build_turn(
                     content: out,
                     is_error,
                     images: Vec::new(),
+                    source: None,
                 });
                 continue;
             }
@@ -2886,6 +2987,7 @@ fn build_turn(
                         content: msg,
                         is_error: false,
                         images: Vec::new(),
+                        source: None,
                     });
                     continue;
                 }
@@ -3519,6 +3621,7 @@ fn record_outcome(
         content: out.content,
         is_error: out.is_error,
         images: out.images,
+        source: out.source,
     }
 }
 

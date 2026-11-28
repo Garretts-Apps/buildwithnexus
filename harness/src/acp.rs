@@ -1793,6 +1793,7 @@ mod tests {
                 content: "hello".into(),
                 is_error: false,
                 images: Vec::new(),
+                source: None,
             }]),
             Msg::Assistant {
                 text: String::new(),
