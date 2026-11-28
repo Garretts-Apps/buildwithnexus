@@ -92,7 +92,8 @@ fn key() -> Option<(Vec<u8>, bool)> {
             // catching a half-written file) must not each make a key, or
             // the stores the first sealed read as rewritten. The one that
             // loses uses the key that won.
-            let tmp = key_file().with_extension(format!("key.{}.{}", std::process::id(), &hex[..8]));
+            let tmp =
+                key_file().with_extension(format!("key.{}.{}", std::process::id(), &hex[..8]));
             let linked = write_private(&tmp, &hex) && std::fs::hard_link(&tmp, key_file()).is_ok();
             let _ = std::fs::remove_file(&tmp);
             if !linked {
