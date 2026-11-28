@@ -3716,6 +3716,32 @@ pub fn save_settings(s: &Settings) {
 /// Edits the user settings file in place as raw JSON, so keys the `Settings`
 /// struct doesn't model (hooks, comments) survive. A missing file starts as
 /// `{}`; a malformed one is refused rather than overwritten.
+/// Add `rule` to the deny list in the user's own settings file (roadmap
+/// 5.4: a proposal the person accepted). A rule already there isn't added
+/// twice.
+pub fn add_user_deny_rule(rule: &str) -> Result<(), String> {
+    update_settings_json(|obj| {
+        let perms = obj
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}));
+        if !perms.is_object() {
+            *perms = serde_json::json!({});
+        }
+        let deny = perms
+            .as_object_mut()
+            .unwrap()
+            .entry("deny")
+            .or_insert_with(|| serde_json::json!([]));
+        if !deny.is_array() {
+            *deny = serde_json::json!([]);
+        }
+        let list = deny.as_array_mut().unwrap();
+        if !list.iter().any(|r| r == rule) {
+            list.push(rule.into());
+        }
+    })
+}
+
 pub fn update_settings_json(
     f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
 ) -> Result<(), String> {

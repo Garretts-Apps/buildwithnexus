@@ -833,3 +833,17 @@ today:
   `end_turn` there; the failure is in the turn's text.
 - **Only the top-level agent runs them.** A helper's changes are checked at
   its parent's finish, not at the helper's own.
+
+### Proposed rules
+
+When you refuse the same kind of call three times, across sessions, bwn
+proposes the deny rule that would refuse it for you (roadmap 5.4). The
+rule names the command's binary and subcommand, the host for a network
+tool, or else the tool. A proposal is only an entry in
+`~/.buildwithnexus/proposals.json`, which commands and file tools can't
+reach. It changes nothing until you run
+`buildwithnexus rules accept <rule>`, which adds the rule to the deny list
+in your own settings. `buildwithnexus rules` lists the proposals, and
+`buildwithnexus rules dismiss <rule>` drops one. No tool the model has can
+accept a proposal. bwn doesn't yet propose regression tests from recurring
+check failures.

@@ -642,6 +642,11 @@ fn confirm_call(
         subject: name,
         detail: label,
     });
+    // A refusal the person keeps making becomes a proposed rule (roadmap
+    // 5.4); it enters the policy only when they accept it.
+    if actor == "user" && decided.is_some() {
+        crate::proposals::note_user_denial(name, tool_key);
+    }
     decided
 }
 

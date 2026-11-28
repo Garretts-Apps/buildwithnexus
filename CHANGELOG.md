@@ -19,6 +19,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Refusals you keep making become proposed rules (roadmap 5.4).** After
+  the third refusal of the same command, host or tool, bwn proposes the
+  deny rule. It joins your settings only when you run
+  `buildwithnexus rules accept <rule>`. `buildwithnexus rules` lists the
+  proposals, and `rules dismiss` drops one.
 - **Risky changes can require an approved plan (roadmap 5.5).** With
   `"risk_planning": "require"`, bwn holds back changes to auth, a schema,
   a public API, CI or the dependencies (classified from paths and

@@ -72,6 +72,7 @@ mod netns;
 pub mod onboarding;
 pub mod policy;
 pub mod posture;
+pub mod proposals;
 pub mod provider;
 pub mod report;
 pub mod rules;
@@ -618,6 +619,7 @@ pub fn run() {
         "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
         "audit" => std::process::exit(audit::cli(&args[1..])),
         "evidence" => std::process::exit(evidence::cli(&args[1..])),
+        "rules" => std::process::exit(proposals::cli(&args[1..])),
         "review" => {
             let req = match ReviewRequest::parse(&args[1..]) {
                 Ok(r) => r,
@@ -2639,6 +2641,7 @@ fn usage_text() -> String {
          \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
          \x20 buildwithnexus audit head|path   a session's decision-log head (from the keyring) or file\n\
          \x20 buildwithnexus evidence verify <commit>   check a commit bwn made against its evidence record\n\
+         \x20 buildwithnexus rules [accept|dismiss <rule>]   list, accept or dismiss the rules bwn proposed from your refusals\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
          \x20 buildwithnexus system-prompt show|edit|suggest|reset|path\n\
          \x20                               the system prompt (--json on show)\n\

@@ -4681,3 +4681,70 @@ fn invariant_sd4_a_seeded_auth_change_cannot_start_without_an_approved_plan() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+// Roadmap 5.4 (SD-6): a refusal the person keeps making becomes a proposed
+// deny rule, and the rule enters the policy only through the person's
+// answer (`buildwithnexus rules accept`): not before, not from a proposal
+// alone, and through no tool the model has.
+#[test]
+fn invariant_sd6_a_rule_enters_the_policy_only_through_a_human_answer() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("bwn-sd6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    let cwd = base.canonicalize().unwrap();
+    std::env::set_var("NEXUS_HOME", cwd.join("home"));
+    let push = json!({"command": "git push origin topic"});
+    let denied_by_policy = |input: &serde_json::Value| {
+        let rules = crate::config::policy_rules(&cwd);
+        denied_by_rule(&rules, "run_command", input, &cwd, None).is_some()
+    };
+    assert!(!denied_by_policy(&push));
+
+    for _ in 0..crate::proposals::THRESHOLD - 1 {
+        crate::proposals::note_user_denial("run_command", "git push");
+    }
+    assert!(
+        crate::proposals::proposed().is_empty(),
+        "proposed before the threshold"
+    );
+    crate::proposals::note_user_denial("run_command", "git push");
+    assert_eq!(crate::proposals::proposed(), ["run_command(git push*)"]);
+    // A proposal is not a rule.
+    assert!(!denied_by_policy(&push), "a proposal changed the policy");
+    // Nothing but the person's own command accepts one: no other code
+    // calls `proposals::accept`, so no tool the model has can.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && !p.ends_with("proposals.rs")
+                && !p.to_string_lossy().contains("tests")
+            {
+                let text = std::fs::read_to_string(&p).unwrap();
+                assert!(
+                    !text.contains("proposals::accept"),
+                    "{} accepts proposals",
+                    p.display()
+                );
+            }
+        }
+    }
+    // The person's answer.
+    crate::proposals::accept("run_command(git push*)").unwrap();
+    assert!(denied_by_policy(&push));
+    assert!(crate::proposals::proposed().is_empty());
+    // Accepting what wasn't proposed does nothing.
+    assert!(crate::proposals::accept("run_command(rm*)").is_err());
+    let settings = std::fs::read_to_string(crate::config::settings_path()).unwrap();
+    assert!(!settings.contains("rm*"), "{settings}");
+
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&cwd);
+}
