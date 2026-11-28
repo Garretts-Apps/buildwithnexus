@@ -547,6 +547,11 @@ pub struct Settings {
     /// 5.7): a changed file under `from` may not contain any of `forbid`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boundaries: Vec<Boundary>,
+    /// `"require"`: a change to auth, a schema, a public API, CI or the
+    /// dependencies needs an approved plan with a threat-model step first
+    /// (roadmap 5.5). `"off"` (the default) doesn't.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub risk_planning: String,
     /// When the transcript is compacted and what stays verbatim (roadmap
     /// 4.5): `threshold_percent` of the model's context (default 80) and
     /// `keep_recent` messages.
@@ -699,6 +704,7 @@ impl Default for Settings {
             checks: None,
             security_gates: Vec::new(),
             boundaries: Vec::new(),
+            risk_planning: String::new(),
             compaction: None,
             fallback_model: None,
             lsp: BTreeMap::new(),
@@ -3173,6 +3179,8 @@ fn untrusted_view(
                 };
                 sandbox_rank(&v).is_some_and(|r| r >= cur.unwrap_or(u8::MAX))
             }
+            // A project may require plans for risky changes, never lift it.
+            "risk_planning" => v.as_str() == Some("require"),
             "max_budget_usd" => match (positive(Some(&v)), positive(base.get(&k))) {
                 (Some(new), Some(cur)) => new <= cur,
                 (Some(_), None) => true,
@@ -3708,6 +3716,32 @@ pub fn save_settings(s: &Settings) {
 /// Edits the user settings file in place as raw JSON, so keys the `Settings`
 /// struct doesn't model (hooks, comments) survive. A missing file starts as
 /// `{}`; a malformed one is refused rather than overwritten.
+/// Add `rule` to the deny list in the user's own settings file (roadmap
+/// 5.4: a proposal the person accepted). A rule already there isn't added
+/// twice.
+pub fn add_user_deny_rule(rule: &str) -> Result<(), String> {
+    update_settings_json(|obj| {
+        let perms = obj
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}));
+        if !perms.is_object() {
+            *perms = serde_json::json!({});
+        }
+        let deny = perms
+            .as_object_mut()
+            .unwrap()
+            .entry("deny")
+            .or_insert_with(|| serde_json::json!([]));
+        if !deny.is_array() {
+            *deny = serde_json::json!([]);
+        }
+        let list = deny.as_array_mut().unwrap();
+        if !list.iter().any(|r| r == rule) {
+            list.push(rule.into());
+        }
+    })
+}
+
 pub fn update_settings_json(
     f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
 ) -> Result<(), String> {

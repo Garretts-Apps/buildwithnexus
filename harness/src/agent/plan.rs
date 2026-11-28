@@ -186,6 +186,9 @@ pub fn plan_turn(
         }
     }
 
+    // Approved (by the person, or by --yes): risky changes may go ahead
+    // under it when it has a threat-model step (roadmap 5.5).
+    super::note_plan_approved(&steps);
     let full = approved_plan_build_task(task, &numbered_plan(&steps));
     drop(running);
     run_build_session_with_images(p, perm, "engineer", &full, cwd, transcript, sid, Vec::new())

@@ -13363,3 +13363,41 @@ fn the_commit_records_which_policy_applied() {
     assert_eq!(rec["policy"]["source"], "settings");
     assert_eq!(rec["policy"]["digest"].as_str().map(str::len), Some(64));
 }
+
+// Roadmap 5.5: a project that requires plans for risky changes gets one.
+// The project file applies untrusted (it only tightens), and a headless
+// auth edit with no approved plan is refused, never written.
+#[test]
+fn invariant_sd4_a_project_requiring_plans_refuses_an_unplanned_auth_change() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        r#"{"risk_planning":"require"}"#,
+    )
+    .unwrap();
+    let port = serve(vec![
+        tool_call(
+            "w",
+            "write_file",
+            json!({"path": "src/auth/session.rs", "content": "pub fn check() -> bool { true }\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "relax the session check");
+    assert!(
+        !cwd.join("src/auth/session.rs").exists(),
+        "the auth change was written"
+    );
+    assert!(!r.success);
+    let denied: String = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_denied" || e["type"] == "tool_result")
+        .map(|e| e.to_string())
+        .collect();
+    assert!(denied.contains("threat-model"), "{denied}");
+}

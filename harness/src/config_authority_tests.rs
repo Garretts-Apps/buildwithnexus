@@ -89,6 +89,12 @@ const KEYS: &[Key] = &[
         ],
     },
     Key {
+        name: "risk_planning",
+        class: Class::Ordered,
+        user: &[r#""require""#, r#""off""#, "5"],
+        project: &[r#""off""#, r#""require""#, "5"],
+    },
+    Key {
         name: "max_budget_usd",
         class: Class::Ordered,
         user: &["5.0", "0", "-1", r#""5""#, "null"],
@@ -447,6 +453,7 @@ fn strictness(key: &str, v: Option<&Value>) -> f64 {
             as f64,
         // A positive budget caps spend; lower is stricter. Anything else is
         // no cap.
+        "risk_planning" => f64::from(u8::from(v.and_then(Value::as_str) == Some("require"))),
         "max_budget_usd" => match positive(v) {
             Some(b) => -b,
             None => f64::NEG_INFINITY,

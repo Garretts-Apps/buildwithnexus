@@ -642,6 +642,11 @@ fn confirm_call(
         subject: name,
         detail: label,
     });
+    // A refusal the person keeps making becomes a proposed rule (roadmap
+    // 5.4); it enters the policy only when they accept it.
+    if actor == "user" && decided.is_some() {
+        crate::proposals::note_user_denial(name, tool_key);
+    }
     decided
 }
 
@@ -889,6 +894,49 @@ fn phase_readonly_reason(reason: String, phase_msg: &str) -> String {
     } else {
         reason
     }
+}
+
+// ── risk-aware planning (roadmap 5.5) ───────────────────────────────────────
+
+// The session whose approved plan has a threat-model step.
+static RISK_PLAN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether a plan's steps include a threat-model step.
+pub fn plan_has_threat_model(steps: &[String]) -> bool {
+    steps.iter().any(|s| {
+        let l = s.to_ascii_lowercase();
+        l.contains("threat model")
+            || l.contains("threat-model")
+            || l.contains("threat modelling")
+            || l.contains("threat modeling")
+    })
+}
+
+/// A person approved a plan for this session (`plan.rs`); it counts for
+/// risky changes when it has a threat-model step.
+pub fn note_plan_approved(steps: &[String]) {
+    if plan_has_threat_model(steps) {
+        *RISK_PLAN.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(crate::session::current_or_new());
+    }
+}
+
+fn risk_plan_approved() -> bool {
+    RISK_PLAN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|s| s == crate::session::current_or_new())
+}
+
+#[cfg(test)]
+pub(crate) fn set_risk_plan_session_for_test(sid: &str) {
+    *RISK_PLAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
+}
+
+#[cfg(test)]
+pub(crate) fn clear_risk_plan() {
+    *RISK_PLAN.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 // ── when auto mode asks ─────────────────────────────────────────────────────
@@ -1271,6 +1319,20 @@ pub(crate) fn gate(
         let delegation = matches!(name, "task" | "spawn_subagent");
         if !readonly_shell && !delegation {
             return Some(READONLY_SKIP.into());
+        }
+    }
+    // Roadmap 5.5: with `risk_planning: "require"`, a change to auth, a
+    // schema, a public API, CI or the dependencies waits for an approved
+    // plan with a threat-model step. The harness classifies the change;
+    // the model can't argue it down, and no approval or rule skips it.
+    if let Some((kind, what)) = tools::risk_class(name, input, cwd) {
+        let required =
+            config::load_settings_from_dir(cwd).is_some_and(|s| s.risk_planning == "require");
+        if required && !risk_plan_approved() {
+            return Some(format!(
+                "this changes {kind} ({}): it needs an approved plan with a threat-model step first. Switch to PLAN (/plan) and approve a plan that includes one",
+                tui::sanitize_terminal(&what)
+            ));
         }
     }
     // D1: no backend under sandbox auto. Before any rule or approval can

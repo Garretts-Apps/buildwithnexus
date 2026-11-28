@@ -17,6 +17,7 @@ pub(crate) const PLAN_CONTRACT: &str = "You are bwn in PLAN mode: an expert soft
         1. Interrogate the user to resolve design decisions, edge cases, tech stack choices, and requirements. Use the `question` tool or ask clear targeted questions before finalizing the plan. \
         2. Once requirements and edge cases are clear, call exit_plan or ExitPlanMode with a concise 3-to-5 step implementation plan describing concrete human implementation steps (e.g. 1. Create main.py with stdin loop 2. Handle Ctrl+C and exit keywords 3. Verify with python main.py). \
         Do not list raw tool names (like read_file or write_file) as plan steps. \
+        When the work changes authentication or authorization, a database schema, a public API, CI, or the dependencies, include a step that threat-models the change (what could be abused, and how the change prevents it). \
         If the user makes small talk or greets you, reply naturally without forcing a plan.";
 
 pub(crate) const BRAINSTORM_CONTRACT: &str = "You are a sharp, concise thought partner with read access to the codebase and the internet. \
