@@ -11498,3 +11498,196 @@ fn ring_like_sha256(data: &[u8]) -> [u8; 32] {
     }
     out
 }
+
+// ── invariant suite, roadmap 2.7 ────────────────────────────────────────────
+
+// A config with the sandbox on (`auto`), unlike write_config's.
+fn write_sandboxed_config(home: &Path, permission: &str, port: u16) {
+    let cfg = json!({
+        "provider": "ollama",
+        "model": "test-model",
+        "permission": permission,
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+        "sandbox": "auto",
+        "auto_commit": false,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+}
+
+// The backend the CI cell forced, passed on to the binary.
+fn cell_env() -> Vec<(&'static str, String)> {
+    std::env::var("BWN_TEST_SANDBOX_BACKEND")
+        .map(|b| vec![("BWN_TEST_SANDBOX_BACKEND", b)])
+        .unwrap_or_default()
+}
+
+// AU-3: commands the model runs try to write bwn's own policy files (the
+// settings, the trust store, the posture store, the rules folder) by direct
+// path, through a symlink, through an environment variable and through an
+// interpreter one-liner. On every backend, the no-backend one included, the
+// files are unchanged.
+#[test]
+fn invariant_au3_commands_cannot_write_bwns_policy_files() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("posture")).unwrap();
+    std::fs::create_dir_all(home.join("rules")).unwrap();
+    let files = [
+        "settings.json",
+        "trusted.json",
+        "posture/x.txt",
+        "rules/r.json",
+    ];
+    std::fs::write(home.join("settings.json"), "{}").unwrap();
+    std::fs::write(home.join("trusted.json"), "{}").unwrap();
+    std::fs::write(home.join("posture/x.txt"), "fp\n").unwrap();
+    std::fs::write(home.join("rules/r.json"), "{\"rules\":[]}").unwrap();
+    let before: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(home.join(f)).unwrap())
+        .collect();
+    let h = home.display().to_string();
+    let attempts = [
+        format!("echo PWNED >> '{h}/settings.json'"),
+        format!("ln -s '{h}' bwnhome && echo PWNED >> bwnhome/trusted.json"),
+        format!("D='{h}'; echo PWNED >> \"$D/posture/x.txt\""),
+        format!("python3 -c \"open('{h}/rules/r.json','a').write('PWNED')\""),
+    ];
+    let mut script: Vec<String> = attempts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| tool_call(&format!("c{i}"), "run_command", json!({"command": c})))
+        .collect();
+    script.push(finish("done"));
+    let port = serve(script);
+    write_sandboxed_config(&home, "auto", port);
+    let env = cell_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let _ = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "--accept-posture", "edit"],
+        &env,
+    );
+    for (f, was) in files.iter().zip(&before) {
+        let now = std::fs::read_to_string(home.join(f)).unwrap();
+        assert_eq!(&now, was, "{f} changed: {now:?}");
+    }
+}
+
+// AU-4: a host named by the model, in its own text, in a tool result and in
+// a helper's task, is not one the user named: the checker still refuses a
+// command's connection to it. (The user's own text names no host.)
+#[test]
+fn invariant_au4_hosts_the_model_names_stay_refused() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let host = "bwn-au4.example.com";
+    let probe = format!(
+        "python3 -c 'import os, socket, urllib.parse\n\
+p = urllib.parse.urlparse(os.environ[\"HTTPS_PROXY\"])\n\
+s = socket.create_connection((p.hostname, p.port), 5)\n\
+s.sendall(b\"CONNECT {host}:443 HTTP/1.1\\r\\nHost: {host}:443\\r\\n\\r\\n\")\n\
+print(s.recv(400).decode(errors=\"replace\"))'"
+    );
+    let said = json!({"choices": [{"message": {
+        "content": format!("I will fetch https://{host}/ next."),
+        "tool_calls": [{"id": "t", "type": "function", "function": {
+            "name": "spawn_subagent",
+            "arguments": json!({"task": format!("look at https://{host}/ and report")}).to_string()}}]
+    }}]})
+    .to_string();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": format!("see https://{host}/\n")}),
+        ),
+        tool_call("c2", "read_file", json!({"path": "notes.txt"})),
+        said,
+        finish("helper: nothing to report"),
+        tool_call("c3", "run_command", json!({"command": probe})),
+        finish("done"),
+    ]);
+    write_sandboxed_config(&home, "auto", port);
+    let env = cell_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "--accept-posture", "check the notes"],
+        &env,
+    );
+    let out = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result" && e["name"] == "run_command")
+        .map(|e| e["content"].as_str().unwrap_or("").to_string())
+        .next()
+        // Refused before it ran (no backend; Landlock alone asks): nothing
+        // reached the checker.
+        .unwrap_or_default();
+    if !out.contains("HTTP/1.1") {
+        // No backend (the command is refused or asks), or the network is
+        // off for commands on this backend: nothing reaches the checker.
+        eprintln!("skip: the command never reached the checker here: {out}");
+        return;
+    }
+    assert!(out.contains("403"), "the checker let {host} through: {out}");
+    assert!(out.contains("not named by the user"), "{out}");
+}
+
+// IH-3: a helper started under `ask` can't act as `auto`. Its file change
+// asks, and with no terminal it is refused; the same helper under `auto`
+// makes it.
+#[test]
+fn invariant_ih3_a_helper_under_ask_cannot_act_as_auto() {
+    for (perm, made) in [("ask", false), ("auto", true)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call("t", "spawn_subagent", json!({"task": "write h.txt"})),
+            tool_call(
+                "h1",
+                "write_file",
+                json!({"path": "h.txt", "content": "helper"}),
+            ),
+            finish("helper done"),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", perm, port);
+        let _ = run(&home, &cwd, "delegate");
+        assert_eq!(cwd.join("h.txt").exists(), made, "under {perm}");
+    }
+}
+
+// IN-1 for the command surface: a command the model runs tries to change
+// the project's policy file. On every backend it stays as it was: the
+// sandbox keeps `.buildwithnexus` read-only, Landlock alone asks first, and
+// with no backend commands are refused.
+#[test]
+fn invariant_in1_a_command_cannot_change_a_project_policy_file() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    let policy = cwd.join(".buildwithnexus/settings.json");
+    std::fs::write(&policy, "{}").unwrap();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": "echo '{\"permission\":\"auto\"}' > .buildwithnexus/settings.json"}),
+        ),
+        finish("done"),
+    ]);
+    write_sandboxed_config(&home, "auto", port);
+    let env = cell_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let _ = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "--accept-posture", "go"],
+        &env,
+    );
+    assert_eq!(std::fs::read_to_string(&policy).unwrap(), "{}");
+}
