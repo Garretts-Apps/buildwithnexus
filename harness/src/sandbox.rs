@@ -341,6 +341,15 @@ pub fn net_for(backend: Backend) -> Net {
             Err(_) => Net::Off,
         };
     }
+    // Bubblewrap runs in the same namespace where one can be made. Where it
+    // can't (a setuid bubblewrap with unprivileged namespaces off), it keeps
+    // the checker held by port, as before.
+    #[cfg(target_os = "linux")]
+    if backend == Backend::Bwrap {
+        if let Ok(s) = crate::netns::session() {
+            return Net::Private(s.port);
+        }
+    }
     if !can_check_egress(backend) {
         return Net::Off;
     }
@@ -557,13 +566,14 @@ fn bwrap_argv(
     // the command gets no network rather than the host's (roadmap 1.6;
     // analysis M8(b)).
     let limiter = match net {
-        Net::Proxy(_) => confine_exe(),
+        Net::Proxy(_) | Net::Private(_) => confine_exe(),
         _ => None,
     };
+    // With Net::Private, bwrap itself was started in the session's private
+    // network namespace (command_for), so sharing the network shares that.
     let share_net = match net {
-        // Only the namespace backend joins the private namespace.
-        Net::Off | Net::Private(_) => false,
-        Net::Proxy(_) => limiter.is_some(),
+        Net::Off => false,
+        Net::Proxy(_) | Net::Private(_) => limiter.is_some(),
         Net::Open => true,
     };
     let mut a: Vec<String> = vec!["--unshare-all".into()];
@@ -633,7 +643,7 @@ fn bwrap_argv(
     a.extend(["--chdir", &cwd, "--"].map(str::to_string));
     // Out only through the proxy: bwn itself, bound in where no hidden path
     // can cover it, limits the network and then runs the command.
-    if let Net::Proxy(port) = net {
+    if let Some(port) = net.checker_port() {
         if let Some(exe) = limiter {
             let at = a.len() - 3;
             a.splice(
@@ -647,13 +657,41 @@ fn bwrap_argv(
             a.extend([
                 CONFINE_EXE.to_string(),
                 "__confine-net".into(),
-                port.to_string(),
+                // In the private namespace only seccomp's TCP-only rule is
+                // needed; the port rule is for the host network.
+                if let Net::Private(_) = net {
+                    format!("private:{port}")
+                } else {
+                    port.to_string()
+                },
                 "--".into(),
             ]);
         }
     }
     a.extend(["sh", "-c", cmd].map(str::to_string));
     a
+}
+
+/// Start `c` (bubblewrap) in the session's private network namespace: it
+/// joins the session's user and network namespaces before exec, and
+/// bubblewrap's `--share-net` then shares that network.
+#[cfg(target_os = "linux")]
+pub(crate) fn join_session_net(c: &mut Command) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let (user, net) = crate::netns::join_fds()?;
+    // SAFETY: setns is async-signal-safe; the fds stay open in bwn for the
+    // session.
+    unsafe {
+        c.pre_exec(move || {
+            if libc::setns(user, libc::CLONE_NEWUSER) != 0
+                || libc::setns(net, libc::CLONE_NEWNET) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 // bwn's own binary; tests point at the built one (a test binary does not
@@ -999,8 +1037,13 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut c = match backend {
         Backend::Bwrap => {
+            let net = net_for(backend);
             let mut c = Command::new("bwrap");
-            c.args(bwrap_args(cmd, &cwd, net_for(backend)));
+            c.args(bwrap_args(cmd, &cwd, net));
+            #[cfg(target_os = "linux")]
+            if let Net::Private(_) = net {
+                join_session_net(&mut c)?;
+            }
             c
         }
         Backend::SandboxExec => {
@@ -2261,6 +2304,81 @@ print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
         std::env::remove_var("BWN_TEST_CONFINE_EXE");
         let _ = std::fs::remove_dir_all(&ws);
         assert_proxy_only(&out);
+    }
+
+    // Roadmap 2.2, SEC-2 on bubblewrap: started in the session's private
+    // network namespace, a command reaches the checker and nothing else:
+    // not this machine's address on the checker's port (which the port rule
+    // let through on the host network), not the host's loopback, no UDP,
+    // DNS, raw, netlink, packet or Unix sockets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invariant_bwrap_netns_command_reaches_only_the_checker() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let usable = Command::new("bwrap")
+            .args(bwrap_probe_args())
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let exe = std::env::current_exe().ok().and_then(|t| {
+            t.ancestors()
+                .map(|a| a.join("buildwithnexus"))
+                .find(|p| p.is_file())
+        });
+        if !usable || exe.is_none() {
+            eprintln!("skip: bwrap or the built binary missing");
+            return;
+        }
+        let Ok(s) = crate::netns::session() else {
+            assert!(
+                std::env::var("BWN_TEST_SANDBOX_BACKEND").as_deref() != Ok("bwrap"),
+                "bubblewrap works but the session namespace can't be made"
+            );
+            return;
+        };
+        let host = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let hp = host.local_addr().unwrap().port();
+        let _same_port = std::net::TcpListener::bind(("0.0.0.0", s.port)).ok();
+        let outer = crate::userns::tests::outer_ip();
+        let outer_arg = outer.map_or("-".to_string(), |ip| ip.to_string());
+        std::env::set_var("BWN_TEST_CONFINE_EXE", exe.unwrap());
+        let ws = std::env::temp_dir().join(format!("bwn-bwrap-netns-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut c = Command::new("bwrap");
+        c.args(bwrap_argv(
+            &format!(
+                "{} {hp} {outer_arg} {}",
+                crate::userns::tests::ESCAPE_PROBE,
+                s.port
+            ),
+            &ws,
+            &[],
+            Net::Private(s.port),
+            false,
+            &[],
+        ))
+        .stdin(Stdio::null());
+        join_session_net(&mut c).unwrap();
+        let out = c.output().unwrap();
+        std::env::remove_var("BWN_TEST_CONFINE_EXE");
+        let _ = std::fs::remove_dir_all(&ws);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = crate::userns::tests::lines(&text);
+        assert_eq!(got.get("checker").map(String::as_str), Some("ok"), "{text}");
+        for (k, v) in &got {
+            if k != "checker" {
+                assert_ne!(v, "ok", "{k} was reachable under bubblewrap: {text}");
+            }
+        }
+        for k in ["host_loopback", "public_v4", "udp", "unix", "dns"] {
+            assert!(got.contains_key(k), "probe line {k} missing: {text}");
+        }
     }
 
     // Real Seatbelt (macOS runners): out only to the proxy's port on

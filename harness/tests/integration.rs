@@ -8078,6 +8078,27 @@ fn b64_head(s: &str, n: usize) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 #[test]
 fn invariant_netns_screenshot_reaches_a_server_a_command_started() {
+    netns_screenshot_case("userns");
+}
+
+// The same on bubblewrap, which runs in the session's namespace too.
+#[cfg(target_os = "linux")]
+#[test]
+fn invariant_bwrap_netns_screenshot_reaches_a_server_a_command_started() {
+    let bwrap = Command::new("bwrap")
+        .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !bwrap {
+        eprintln!("skip: bubblewrap unusable here");
+        return;
+    }
+    netns_screenshot_case("bwrap");
+}
+
+#[cfg(target_os = "linux")]
+fn netns_screenshot_case(backend: &str) {
     let userns = Command::new("unshare")
         .args(["-Ur", "true"])
         .stdin(Stdio::null())
@@ -8127,7 +8148,7 @@ fn invariant_netns_screenshot_reaches_a_server_a_command_started() {
         &home,
         &cwd,
         &["--json", "run", "how does the page look?"],
-        &[("BWN_TEST_SANDBOX_BACKEND", "userns")],
+        &[("BWN_TEST_SANDBOX_BACKEND", backend)],
     );
     // The server is the session's; nothing of it is left on this machine.
     let from_host = std::net::TcpStream::connect(("127.0.0.1", pp)).is_ok();

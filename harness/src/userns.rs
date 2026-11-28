@@ -304,7 +304,7 @@ pub fn available() -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
 
@@ -517,7 +517,7 @@ mod tests {
     // What a command in the session's network namespace can reach, checked
     // by python3 inside it. argv: a host port, this machine's own non-
     // loopback address (or "-"), the checker's port inside.
-    const ESCAPE_PROBE: &str = r#"python3 -c '
+    pub(crate) const ESCAPE_PROBE: &str = r#"python3 -c '
 import socket, sys, errno
 def why(e):
     return errno.errorcode.get(e.errno, type(e).__name__)
@@ -555,14 +555,14 @@ except OSError as e:
 ' "#;
 
     // This machine's address on its default route, if it has one.
-    fn outer_ip() -> Option<std::net::IpAddr> {
+    pub(crate) fn outer_ip() -> Option<std::net::IpAddr> {
         let u = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
         u.connect(("192.0.2.1", 9)).ok()?;
         let ip = u.local_addr().ok()?.ip();
         (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
     }
 
-    fn lines(out: &str) -> std::collections::HashMap<String, String> {
+    pub(crate) fn lines(out: &str) -> std::collections::HashMap<String, String> {
         out.lines()
             .filter_map(|l| l.split_once(' '))
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -853,6 +853,13 @@ for f in (\"environ\", \"mem\", \"maps\"):\n    try:\n        open(\"/proc/{hold
         let (ok, out) = c.run_net("python3 web6.py", crate::landlock::Net::Private(s.port));
         assert!(ok, "{out}");
         if out.contains("NOV6") {
+            // GitHub's runners have IPv6 loopback: the forced cell must not
+            // pass by skipping.
+            assert!(
+                !(std::env::var_os("GITHUB_ACTIONS").is_some()
+                    && std::env::var("BWN_TEST_SANDBOX_BACKEND").as_deref() == Ok("userns")),
+                "no IPv6 in the namespace on a CI runner: {out}"
+            );
             eprintln!("skip: no IPv6 in the namespace here ({out})");
             return;
         }

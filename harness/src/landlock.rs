@@ -494,22 +494,40 @@ pub fn confine_net_and_exec(args: &[String]) -> ! {
         eprintln!("bwn sandbox: {e}");
         std::process::exit(126)
     };
+    // `<port>` on the host network; `private:<port>` in the session's
+    // private network namespace, where only seccomp's TCP-only rule applies.
+    let first = args.first().map(String::as_str).unwrap_or("");
+    let (private, port) = match first.strip_prefix("private:") {
+        Some(p) => (true, p.parse::<u16>().ok()),
+        None => (false, first.parse::<u16>().ok()),
+    };
     let (Some(port), Some(rest)) = (
-        args.first().and_then(|p| p.parse::<u16>().ok()),
+        port,
         args.iter().position(|a| a == "--").map(|i| &args[i + 1..]),
     ) else {
-        fail("usage: __confine-net <port> -- <program> <args>".into())
+        fail("usage: __confine-net [private:]<port> -- <program> <args>".into())
     };
     let Some((prog, prog_args)) = rest.split_first() else {
         fail("no program to run".into())
     };
-    let net = Net::Proxy(port);
-    let fd = net_ruleset(net).unwrap_or_else(|e| fail(format!("network rules: {e}")));
-    // Inside bubblewrap the mount namespace already confines truncate(2).
-    if let Err(e) = engage(fd, net, false) {
-        fail(format!("network rules: {e}"));
+    if private {
+        let net = Net::Private(port);
+        // SAFETY: a plain prctl; seccomp requires no_new_privs.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            fail(format!("network rules: {}", io::Error::last_os_error()));
+        }
+        if let Err(e) = seccomp(net, false) {
+            fail(format!("network rules: {e}"));
+        }
+    } else {
+        let net = Net::Proxy(port);
+        let fd = net_ruleset(net).unwrap_or_else(|e| fail(format!("network rules: {e}")));
+        // Inside bubblewrap the mount namespace already confines truncate(2).
+        if let Err(e) = engage(fd, net, false) {
+            fail(format!("network rules: {e}"));
+        }
+        unsafe { libc::close(fd) };
     }
-    unsafe { libc::close(fd) };
     let e = Command::new(prog).args(prog_args).exec();
     fail(format!("{prog}: {e}"))
 }
