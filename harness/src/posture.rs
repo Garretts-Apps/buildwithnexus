@@ -1297,7 +1297,10 @@ mod tests {
         // On Landlock alone the network is off until allowed for the
         // session; allow it so the checked row (and its hosts) is tested.
         crate::sandbox::allow_landlock_network_for_session();
-        let home = std::env::temp_dir().join(format!("bwn-posture-keys-{}", std::process::id()));
+        // Outside the temp folder: on Landlock alone a store there can't be
+        // carved out, so the row would not list it.
+        let home = crate::sandbox::tests::test_home_base()
+            .join(format!("bwn-posture-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("NEXUS_HOME", &home);

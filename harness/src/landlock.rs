@@ -430,11 +430,22 @@ fn build(
         .collect();
     // A root that holds a hidden path cannot have it carved out; the
     // session reports reads as not confined then (sandbox::hides_reads).
-    let hidden = if can_hide(&roots, &hidden) {
-        hidden
+    // On Landlock alone every writable root counts, the temp folders too:
+    // a store under TMPDIR would otherwise be readable and writable. The
+    // namespace backend covers each store after its binds, so only the
+    // workspace roots matter there.
+    let all_writable = write_roots(&cwd, extra, tmp.as_deref());
+    let check_roots: Vec<&Path> = if userns {
+        roots.clone()
     } else {
-        Vec::new()
+        all_writable.iter().map(PathBuf::as_path).collect()
     };
+    // Only the stores that can't be carved out are left readable; the rest
+    // stay hidden (one store under a temp folder must not expose ~/.ssh).
+    let hidden: Vec<PathBuf> = hidden
+        .into_iter()
+        .filter(|h| can_hide(&check_roots, std::slice::from_ref(h)))
+        .collect();
     let fd = ruleset_with(&cwd, extra, tmp.as_deref(), &hidden, net)
         .map_err(|e| format!("landlock ruleset: {e} (the kernel may not have Landlock enabled)"))?;
     // SAFETY: ruleset returned a fresh fd that nothing else owns.

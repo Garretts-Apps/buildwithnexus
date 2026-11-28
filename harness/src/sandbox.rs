@@ -1321,8 +1321,17 @@ pub fn hides_reads(cwd: &Path) -> bool {
     match decide(mode(), backend()) {
         Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
         #[cfg(target_os = "linux")]
-        Decision::Sandboxed(Backend::Landlock | Backend::Userns) => {
+        Decision::Sandboxed(Backend::Userns) => {
             crate::landlock::can_hide(&roots, &hidden_paths(&roots))
+        }
+        // Landlock alone can't carve a store out of any writable root, the
+        // temp folders included.
+        #[cfg(target_os = "linux")]
+        Decision::Sandboxed(Backend::Landlock) => {
+            let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
+            let writable = crate::landlock::write_roots(&cwd, &extra, tmp.as_deref());
+            let writable: Vec<&Path> = writable.iter().map(PathBuf::as_path).collect();
+            crate::landlock::can_hide(&writable, &hidden_paths(&roots))
         }
         _ => false,
     }
@@ -2046,6 +2055,40 @@ pub(crate) mod tests {
             std::panic::resume_unwind(e);
         }
         true
+    }
+
+    // On Landlock alone a store under a writable temp folder can't be
+    // carved out (a rule on the root grants everything beneath it), so
+    // nothing may claim it hidden: the startup check says readable and
+    // auto mode asks. The namespace backend covers it, so there it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invariant_landlock_a_store_under_temp_is_not_claimed_hidden() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let b = backend();
+        if !matches!(b, Some(Backend::Landlock) | Some(Backend::Userns)) {
+            eprintln!("skip: not Landlock or the namespace backend");
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("bwn-tmpstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_test"), "KEY").unwrap();
+        let ws = test_home_base().join(format!("bwn-tmpstore-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = Some(home.clone()));
+        TEST_MODE.with(|m| m.set(Some(Mode::Auto)));
+        let hides = hides_reads(&ws);
+        TEST_MODE.with(|m| m.set(None));
+        crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ws);
+        match b {
+            Some(Backend::Landlock) => assert!(!hides, "claimed a store under temp hidden"),
+            _ => assert!(hides, "the namespace backend covers it"),
+        }
     }
 
     // IH-1 for extensions (roadmap 2.4): what a stdio MCP server or a hook

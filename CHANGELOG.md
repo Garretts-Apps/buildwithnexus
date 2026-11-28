@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Landlock alone: a credential store under a temp folder is no longer
+  claimed hidden.** Landlock can't carve a store out of a folder commands
+  may write. bwn checked that only for the workspace, not for `/tmp` or
+  `TMPDIR`, so a store there was readable and writable while the startup
+  check said hidden. Now the check says readable and auto mode asks. bwn's
+  namespace backend covers such a store, so nothing changes there.
+- **Landlock alone: one store that can't be hidden no longer exposes the
+  rest.** When any store lay inside a folder commands may write, Landlock
+  dropped the whole hidden list, so `~/.ssh` became readable along with it.
+  Now only that store stays readable, and the startup check still says not
+  every store is hidden.
 - **macOS: credential stores are write-protected too, wherever they are.**
   Seatbelt refused reads of a hidden store but not writes, so a store
   inside a folder commands may write (bwn's own folder under the temp
