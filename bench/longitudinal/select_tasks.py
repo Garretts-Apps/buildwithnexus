@@ -12,8 +12,10 @@ that suit that, and scores them on what the design asks for:
   added or modified (the tasks depend on each other);
 - a mix of sizes, with no change so large it is a release merge.
 
-It prints the best windows as JSON. Choosing among them, writing each
-requirement and running the harnesses are later steps (roadmap 6.1).
+It prints the best windows as JSON. With `--manifest`, it prints a draft
+manifest for `runner.py` from the best eligible window instead: each task
+with its hidden test files and its historical commit, every fifth task held
+out, and the commit's subject as a requirement to rewrite before a run.
 
     python3 bench/longitudinal/select_tasks.py /path/to/repo [--length 20] [--top 3]
 """
@@ -74,12 +76,39 @@ def score(window: list[dict]) -> dict:
     }
 
 
+def draft_manifest(repo: Path, cs: list[dict], best: dict | None) -> dict:
+    """A runner manifest for `best`: its tasks with their hidden tests."""
+    if best is None:
+        return {"error": "no window of that length"}
+    start = next(i for i, c in enumerate(cs) if c["sha"] == best["start"])
+    window = cs[start : start + len(best["tasks"])]
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{window[0]['sha']}^"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    tasks = []
+    for n, c in enumerate(window, 1):
+        tasks.append({
+            "id": f"t{n:02d}",
+            "requirement": f"DRAFT, rewrite as a requirement with acceptance criteria: {c['subject']}",
+            "tests": [f for f in c["files"] if TEST.search(f)],
+            "from_commit": c["sha"],
+            "held_out": n % 5 == 0,
+        })
+    return {
+        "repo": str(repo), "base": base, "eligible": best["eligible"],
+        "test_command": "SET ME, e.g. pytest -q {tests}", "suite_command": "",
+        "tasks": tasks, "harnesses": [], "model": {}, "runs": 3, "task_timeout_secs": 1800,
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("repo", type=Path)
     p.add_argument("--length", type=int, default=20)
     p.add_argument("--history", type=int, default=2000, help="How many recent commits to scan.")
     p.add_argument("--top", type=int, default=3)
+    p.add_argument("--manifest", action="store_true", help="Print a draft runner manifest for the best window.")
     a = p.parse_args()
     cs = changes(a.repo, a.history)
     windows = []
@@ -89,6 +118,9 @@ def main() -> None:
         windows.append({"start": w[0]["sha"], "end": w[-1]["sha"], **s,
                         "tasks": [{"sha": c["sha"][:12], "subject": c["subject"]} for c in w]})
     windows.sort(key=lambda w: (w["eligible"], w["with_tests"], w["dependent"]), reverse=True)
+    if a.manifest:
+        print(json.dumps(draft_manifest(a.repo, cs, windows[0] if windows else None), indent=2))
+        return
     print(json.dumps({"repo": str(a.repo), "scanned": len(cs), "windows": windows[: a.top]}, indent=2))
 
 

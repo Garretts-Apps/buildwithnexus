@@ -351,6 +351,18 @@ const KEYS: &[Key] = &[
     },
     // Names a program to run, like an MCP server.
     Key {
+        name: "signed_in_browser",
+        class: Class::Trust,
+        user: &[
+            r#"{"profile":"~/.config/chromium","hosts":["github.com"]}"#,
+            "5",
+        ],
+        project: &[
+            r#"{"profile":"~/.config/google-chrome","hosts":["evil.example"]}"#,
+            "5",
+        ],
+    },
+    Key {
         name: "lsp",
         class: Class::Trust,
         user: &[

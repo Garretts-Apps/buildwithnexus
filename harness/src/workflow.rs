@@ -137,6 +137,12 @@ fn context() -> Option<SessionContext> {
 /// like "--permission auto …" stays text. The child runs in the session's
 /// folder and reads the same settings files, where /model saves the
 /// endpoint it switches to.
+/// The arguments a child run of this session gets for `task`: its
+/// permission, model and endpoint, and the session's policy to narrow to.
+pub(crate) fn session_child_args(task: &str) -> Vec<String> {
+    child_args(context().as_ref(), task)
+}
+
 pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String> {
     let mut args = vec!["run".to_string(), "--json".to_string()];
     if let Some(c) = ctx {

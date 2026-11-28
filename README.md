@@ -388,6 +388,7 @@ Inside the interactive session:
 /agents                   helper agents from agent files, then Agents.md
 /add-dir [path]           also work in another folder for this session (no path: list them)
 /schedule <delay> <task>  run a task once in the background (5s, 2m, 1h)
+/bg <task>                run a task in a worktree of its own; `bwn bg merge <branch>` merges what verifies
 /loop <interval> <task>   run a task repeatedly in the background (up to max_concurrent_workflows at once, default 2)
 /workflows                list and manage background workflows (i<id> shows a run's log, kept in ~/.buildwithnexus/workflows/)
 /btw <context>            add a note to your next message

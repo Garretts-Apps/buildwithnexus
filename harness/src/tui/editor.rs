@@ -388,6 +388,14 @@ pub const COMMANDS: &[SlashCommand] = &[
     ),
     cmd(
         AUTO,
+        "/bg",
+        &[],
+        "<task>",
+        "run a task in a worktree of its own",
+        &[],
+    ),
+    cmd(
+        AUTO,
         "/loop",
         &[],
         "<interval> <task>",

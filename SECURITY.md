@@ -471,6 +471,25 @@ narrow. A helper in the session shares its state, so a helper started under
 the session's policy as `--inherit-policy` and runs with the stricter of
 that and its own settings in every field.
 
+A background agent (`/bg <task>`, or `buildwithnexus bg run <task>`;
+roadmap 5.2) is such a child, never a daemon:
+- **Where it runs:** in a git worktree of its own, on a new branch made
+  without running the repository's hooks.
+- **Approvals:** it has no terminal, so a call that would ask is refused.
+  It can't answer its own approvals.
+- **Commits:** its edits are committed only once its checks pass, and each
+  commit names its evidence record.
+- **Merging:** the work comes back only through
+  `buildwithnexus bg merge <branch>`, a command you run. It merges only
+  when every commit the branch adds verifies against its record, and
+  otherwise names each commit that doesn't.
+- **Experiments:** `buildwithnexus bg try <n> <task>` (roadmap 5.8) runs
+  the task as n such agents and scores each one: whether every commit
+  verifies, whether the run succeeded, and how much it changed. The
+  comparison is kept as a content-hashed record in the evidence store.
+  Merging a variant names that record in a `Bwn-Experiment:` trailer, and
+  `buildwithnexus evidence verify` checks the merge against it.
+
 So a workflow started after the session read untrusted text keeps asking in
 auto mode, and one started from `--sandbox require` keeps `require`. Its
 task, which the model wrote, adds no host the checker would let a command
@@ -845,5 +864,32 @@ reach. It changes nothing until you run
 `buildwithnexus rules accept <rule>`, which adds the rule to the deny list
 in your own settings. `buildwithnexus rules` lists the proposals, and
 `buildwithnexus rules dismiss <rule>` drops one. No tool the model has can
-accept a proposal. bwn doesn't yet propose regression tests from recurring
-check failures.
+accept a proposal.
+
+The same goes for a test that keeps failing. When the project's checks
+fail on the same cargo, pytest or Go test in three turns, bwn proposes a
+regression check that runs that one test on every change. Accepting it
+adds it to the project's `checks`, and with it the checks bwn detects, so
+none drop out. A project file that changed waits for trust again, as
+always. A test name with anything but letters, digits and `_:./-[]`
+isn't proposed, so a report can't turn into a command.
+
+### The signed-in browser
+
+`"signed_in_browser": {"profile": "<browser profile folder>", "hosts":
+["github.com"]}` gives the model a `signed_in_browser` tool that reads a
+page as you, on those hosts only (roadmap 5.9). How it's held back:
+- **A copy of the profile.** It runs from a throwaway copy of the profile,
+  without its caches and without following links, so nothing it does
+  writes back to yours.
+- **Only the listed hosts.** Every other request, a bare IP address
+  included, goes to a proxy that refuses it. A page's planted image, fetch
+  or redirect can't take your cookies to another site, and the tool's
+  result names the hosts it refused.
+- **Scripts off, nothing clicked.** JavaScript is blocked in the copy and
+  the page is only read, so a planted instruction can't submit a form.
+- **Untrusted.** What it reads is labelled untrusted, so in auto mode
+  commands, fetches and MCP calls ask afterwards.
+- **Trust.** A project file's `signed_in_browser` waits for trust.
+- **What it can't do:** pages that need scripts to show their content
+  read as empty.

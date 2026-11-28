@@ -373,6 +373,21 @@ pub(super) fn repl(
             continue;
         }
 
+        // /bg <task>: a background agent in a worktree of its own (roadmap
+        // 5.2).
+        if let Some(task) = slash_args(t, "/bg") {
+            let task = task.trim();
+            if task.is_empty() {
+                tui::line(&tui::red("  usage: /bg <task>  — runs it in a worktree of its own; merge with `buildwithnexus bg merge <branch>`"));
+            } else {
+                match crate::bgagent::start_in_session(task, cwd) {
+                    Ok(line) => tui::line(&tui::green(&format!("  ✓ {line}"))),
+                    Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+                }
+            }
+            continue;
+        }
+
         // /loop <interval> <task>  e.g. `/loop 10m cargo test`
         if let Some(rest) = slash_args(t, "/loop") {
             let mut parts = rest.splitn(2, char::is_whitespace);
@@ -1098,6 +1113,7 @@ fn tick_background(perm: Permission, provider: &Provider, shown_active: &mut usi
     );
     let mut notes = workflow::take_notices();
     notes.extend(workflow::tick());
+    notes.extend(crate::bgagent::poll());
     for note in notes {
         if note.contains('✗') {
             tui::line(&tui::red(&note));

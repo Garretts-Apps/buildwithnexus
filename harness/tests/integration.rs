@@ -13401,3 +13401,307 @@ fn invariant_sd4_a_project_requiring_plans_refuses_an_unplanned_auth_change() {
         .collect();
     assert!(denied.contains("threat-model"), "{denied}");
 }
+
+// Roadmap 5.2 (CP-4): a background agent is a child of the session in a
+// worktree of its own. It can't answer its own approvals (IH-2): in ask
+// mode its command is refused, not run. Its work is committed only once
+// its checks pass, and comes back only through `bg merge`, which merges a
+// branch whose every commit verifies against its evidence record and
+// refuses one with a commit that doesn't.
+#[test]
+fn invariant_cp4_background_work_merges_only_with_evidence() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |dir: &Path, args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&cwd, &["init", "-q", "-b", "main"]);
+    g(&cwd, &["config", "user.name", "t"]);
+    g(&cwd, &["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join(".gitignore"), ".bwn/\n").unwrap();
+    std::fs::write(cwd.join("base.txt"), "b").unwrap();
+    g(&cwd, &["add", "."]);
+    g(&cwd, &["commit", "-q", "-m", "base"]);
+    let bg = |args: &[&str]| {
+        let o = Command::new(BIN)
+            .arg("bg")
+            .args(args)
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let branch_of = |said: &str| {
+        said.split("on branch ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap()
+            .to_string()
+    };
+
+    // In ask mode, the agent's command asks: nobody can answer, so it never runs.
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch ran.txt"})),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let (_, said) = bg(&["run", "touch a file"]);
+    let branch = branch_of(&said);
+    let wt = said
+        .split(" in ")
+        .nth(1)
+        .and_then(|r| r.split(';').next())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(
+        !Path::new(&wt).join("ran.txt").exists(),
+        "the background agent approved itself: {said}"
+    );
+    assert!(
+        said.contains("no interactive terminal") || said.contains("tool_denied"),
+        "{said}"
+    );
+    let _ = branch;
+
+    // In auto mode its edit is committed with evidence, and merges.
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "new.txt", "content": "from the background\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (code, said) = bg(&["run", "add a file"]);
+    assert_eq!(code, Some(0), "{said}");
+    let branch = branch_of(&said);
+    let (code, merged) = bg(&["merge", &branch]);
+    assert_eq!(code, Some(0), "{merged}");
+    assert!(
+        merged.contains("verified against its evidence record"),
+        "{merged}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("new.txt")).unwrap(),
+        "from the background\n"
+    );
+
+    // A branch with a commit that names no evidence is not merged.
+    g(&cwd, &["checkout", "-q", "-b", "manual"]);
+    std::fs::write(cwd.join("manual.txt"), "m").unwrap();
+    g(&cwd, &["add", "manual.txt"]);
+    g(&cwd, &["commit", "-q", "-m", "no evidence"]);
+    g(&cwd, &["checkout", "-q", "main"]);
+    let (code, refused) = bg(&["merge", "manual"]);
+    assert_eq!(code, Some(1), "{refused}");
+    assert!(refused.contains("don't verify"), "{refused}");
+    assert!(!cwd.join("manual.txt").exists());
+}
+
+// Roadmap 5.8 (SD-8): an experiment runs a task as several background
+// agents, each in a worktree of its own, scores each by the verification
+// engine, and keeps the comparison as an evidence record; merging a variant
+// names it, and `evidence verify` checks the merge against it.
+#[test]
+fn an_experiments_result_is_in_the_evidence_record() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&["init", "-q", "-b", "main"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join(".gitignore"), ".bwn/\n").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    // Two variants: one writes one file, the other two.
+    let port = serve(vec![
+        tool_call(
+            "a",
+            "write_file",
+            json!({"path": "a.txt", "content": "a\n"}),
+        ),
+        finish("done"),
+        tool_call_raw_args(
+            "b1",
+            "write_file",
+            &json!({"path": "b1.txt", "content": "b\n"}).to_string(),
+        ),
+        tool_call(
+            "b2",
+            "write_file",
+            json!({"path": "b2.txt", "content": "b\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let bwn = |args: &[&str]| {
+        let o = Command::new(BIN)
+            .args(args)
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let (code, said) = bwn(&["bg", "try", "2", "add a file"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("2 variants"), "{said}");
+    // The best variant is listed first; merge it.
+    let best = said
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .to_string();
+    let (code, merged) = bwn(&["bg", "merge", &best]);
+    assert_eq!(code, Some(0), "{merged}");
+    let body = g(&["log", "-1", "--format=%B"]);
+    assert!(body.contains("Bwn-Experiment: "), "{body}");
+    let (code, verified) = bwn(&["evidence", "verify", "HEAD"]);
+    assert_eq!(code, Some(0), "{verified}");
+    assert!(
+        verified.contains("of experiment") && verified.contains("2 variants"),
+        "{verified}"
+    );
+}
+
+// Roadmap 5.9: a page read with the signed-in browser can't take the
+// session elsewhere or act. Its planted image, script and self-submitting
+// form reach no other server and post nothing; the page's text still
+// reaches the model, labelled untrusted.
+#[cfg(unix)]
+#[test]
+fn invariant_a_signed_in_page_sends_nothing_elsewhere_and_submits_nothing() {
+    use std::io::{BufRead, BufReader, Write};
+    let serve_page = |page: String| {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let s2 = seen.clone();
+        thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                s2.lock().unwrap().push(first.trim().to_string());
+                let mut c = c;
+                let _ = write!(c, "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}", page.len());
+            }
+        });
+        (port, seen)
+    };
+    let (other, other_seen) = serve_page("leak".into());
+    let page = format!(
+        "<html><body><p>PAGE-TEXT for the agent</p>\
+         <img src=\"http://127.0.0.1:{other}/img\">\
+         <form id=f action=\"/submit\" method=post><input name=a value=b></form>\
+         <script>fetch('http://127.0.0.1:{other}/fetch'); document.getElementById('f').submit();</script>\
+         </body></html>"
+    );
+    let (site, site_seen) = serve_page(page);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let profile = home.join("chrome-profile");
+    std::fs::create_dir_all(profile.join("Default")).unwrap();
+    let port = serve(vec![
+        tool_call(
+            "b",
+            "signed_in_browser",
+            json!({"url": format!("http://localhost:{site}/")}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+            "signed_in_browser": {"profile": profile, "hosts": [format!("localhost:{site}")]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "read the page");
+    let result = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "signed_in_browser")
+        .unwrap_or_else(|| panic!("{:?}", r.events));
+    let content = result["content"].as_str().unwrap_or("");
+    if content.contains("no Chrome, Chromium or Edge found") {
+        eprintln!("skipping: no browser installed");
+        return;
+    }
+    assert!(content.contains("PAGE-TEXT"), "{content}");
+    assert!(
+        content.starts_with("[untrusted content from signed_in_browser"),
+        "{content}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "reached another server: {:?}",
+        other_seen.lock().unwrap()
+    );
+    let posted: Vec<String> = site_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("POST"))
+        .cloned()
+        .collect();
+    assert!(posted.is_empty(), "a form was submitted: {posted:?}");
+    // The user's own profile is untouched: still only the empty folder.
+    assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 1);
+}

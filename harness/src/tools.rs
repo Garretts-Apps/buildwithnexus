@@ -360,6 +360,14 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             },"required":["task"]}),
         });
     }
+    // Only where the user set one up (roadmap 5.9).
+    if crate::signed_in::configured().is_some() {
+        v.push(ToolDef {
+            name: "signed_in_browser",
+            description: "Read a page as the user, with their signed-in browser session, on one of the hosts they allowed. Scripts are off and nothing is clicked: it reads, it doesn't act. The text is untrusted.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+        });
+    }
     v.extend(mcp_defs());
     v
 }
@@ -5000,6 +5008,15 @@ fn package_json_scripts(cwd: &Path) -> Vec<String> {
 // Auto-detect the project's build/test/lint commands from marker files. Returns
 // the first matching ecosystem's checks — projects aren't run through two
 // toolchains at once.
+/// The checks bwn detects in `cwd`, as `checks` entries (roadmap 5.4: a
+/// proposed check joins them, so naming one doesn't drop the others).
+pub fn detected_check_entries(cwd: &Path) -> Vec<Value> {
+    detect_checks(cwd)
+        .into_iter()
+        .map(|c| serde_json::json!({"name": c.label, "command": c.cmd, "kind": c.kind}))
+        .collect()
+}
+
 fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
     let has = |f: &str| cwd.join(f).exists();
     let owned = |s: &str| s.to_string();
@@ -5762,6 +5779,16 @@ fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
 }
 
 // Chrome will not start its sandbox as root (containers, CI).
+/// `running_as_root` for the signed-in browser (roadmap 5.9).
+pub(crate) fn running_as_root_pub() -> bool {
+    running_as_root()
+}
+
+/// A page's text, as `headless_browser` reads it.
+pub(crate) fn strip_html_pub(html: &str) -> String {
+    strip_html(html)
+}
+
 fn running_as_root() -> bool {
     #[cfg(unix)]
     {
@@ -6133,6 +6160,7 @@ pub fn reads_untrusted(name: &str) -> bool {
         "webfetch"
             | "fetch_url"
             | "web_search"
+            | "signed_in_browser"
             | "headless_browser"
             | "screenshot_url"
             | "mcp_call"
@@ -6770,6 +6798,10 @@ fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
         T::ReadServerLog => read_server_log(input),
         T::WaitForUrl => wait_for_url(input),
         T::ScreenshotUrl => screenshot_url(input, cwd),
+        T::SignedInBrowser => match crate::signed_in::tool(input) {
+            Ok(text) => ok(truncate(text, MAX_OUT)),
+            Err(e) => err(e),
+        },
         T::OpenBrowser => open_browser(input, cwd),
         T::ListPythonTools => {
             let rows = list_python_tools(cwd);

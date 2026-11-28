@@ -3241,6 +3241,11 @@ fn build_turn(
                     timestamp: String::new(),
                 });
                 if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
+                    // A test that keeps failing becomes a proposed check
+                    // (roadmap 5.4).
+                    if out.is_error {
+                        crate::proposals::note_check_failure(cwd, &out.content);
+                    }
                     st.check_work_passed = Some(!out.is_error);
                     st.check_report = out.content.clone();
                     st.security_checked = !out.is_error
@@ -3946,6 +3951,13 @@ mod unrun_call_tests {
 }
 
 mod review;
+
+/// A worktree on a new branch from HEAD for work done apart from this
+/// checkout (roadmap 5.2): its path, branch and base commit. Made without
+/// running the repository's hooks or fsmonitor.
+pub(crate) fn make_isolated_worktree(cwd: &Path) -> Result<(PathBuf, String, String), String> {
+    review::make_worktree(cwd).map(|w| (w.path, w.branch, w.base))
+}
 use review::*;
 mod parallel_tools;
 use parallel_tools::*;

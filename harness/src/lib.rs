@@ -47,6 +47,7 @@ mod acp;
 pub mod agent;
 pub mod audit;
 pub mod aws;
+pub mod bgagent;
 pub mod capabilities;
 pub mod checkpoint;
 pub mod config;
@@ -80,6 +81,7 @@ pub mod sandbox;
 pub mod screenshot;
 pub mod seal;
 pub mod session;
+pub mod signed_in;
 pub mod sixel;
 mod system_prompt;
 pub mod tools;
@@ -620,6 +622,7 @@ pub fn run() {
         "audit" => std::process::exit(audit::cli(&args[1..])),
         "evidence" => std::process::exit(evidence::cli(&args[1..])),
         "rules" => std::process::exit(proposals::cli(&args[1..])),
+        "bg" => std::process::exit(bgagent::cli(&args[1..])),
         "review" => {
             let req = match ReviewRequest::parse(&args[1..]) {
                 Ok(r) => r,

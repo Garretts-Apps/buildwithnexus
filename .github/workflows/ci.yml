@@ -734,6 +734,11 @@ jobs:
       - name: Test the install matrix script
         run: bash scripts/field/linux-install.sh --self-test
 
+      # The longitudinal benchmark's runner (roadmap 6.1), with scripted
+      # harnesses in place of a model.
+      - name: Test the longitudinal runner
+        run: python3 -m unittest bench.longitudinal.test_runner
+
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest

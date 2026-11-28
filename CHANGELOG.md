@@ -19,6 +19,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **A browser with your signed-in session (roadmap 5.9).**
+  `"signed_in_browser": {"profile": ..., "hosts": [...]}` adds a tool that
+  reads pages on those hosts as you. It runs from a copy of the profile,
+  with scripts off, and reads without clicking anything. Every other host
+  goes to a refusing proxy, so a planted image, script or form reaches
+  nothing and submits nothing. What it reads is labelled untrusted.
+- **A test that keeps failing becomes a proposed regression check (roadmap
+  5.4).** After the same cargo, pytest or Go test fails the project's
+  checks in three turns, `buildwithnexus rules accept check:<id>` adds a
+  check that runs it on every change. The check is added to the project's
+  `checks`, along with the detected checks.
+- **Experiments scored by verification (roadmap 5.8).**
+  `buildwithnexus bg try <n> <task>` runs the task as n background agents
+  in worktrees of their own. Each variant is scored by whether its commits
+  verify, whether the run succeeded, and how much it changed, and the
+  comparison is kept as an evidence record. Merging a variant with
+  `bg merge` adds a `Bwn-Experiment:` trailer that names the record, and
+  `evidence verify` checks it.
+- **Background agents in worktrees of their own (roadmap 5.2).**
+  - **Starting:** `/bg <task>` (or `buildwithnexus bg run <task>`) runs the
+    task as a child of the session, on a new branch in its own worktree,
+    with the session's policy.
+  - **Approvals:** it can't answer its own approvals.
+  - **Commits:** its work is committed once its checks pass, with
+    evidence.
+  - **Merging:** `buildwithnexus bg merge <branch>` merges only when every
+    commit verifies against its evidence record.
 - **Refusals you keep making become proposed rules (roadmap 5.4).** After
   the third refusal of the same command, host or tool, bwn proposes the
   deny rule. It joins your settings only when you run
