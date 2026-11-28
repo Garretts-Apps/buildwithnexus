@@ -26,3 +26,6 @@ harness/.cargo/
 .buildwithnexus/artifacts/
 .buildwithnexus/settings.local.json
 test_output.log
+
+# Written by aider when the bench runs it from the repo root.
+.aider*
