@@ -26,7 +26,9 @@ runs the checks it detects.
 A check can be for some files only: `"paths": ["*.css", "web/*"]` runs it
 when a changed file's path or name matches one of the globs, so styles,
 scripts or templates each get their own checks. A check without `paths`
-runs for every change.
+runs for every change. The commit's evidence record names the checks that
+applied and a digest of the policy they came from (`buildwithnexus evidence
+verify <commit>` shows it).
 
 A check can be read from a scanner's report instead of its exit status:
 `"format": "sarif"` (SARIF 2.1.0) or `"json"` (a list of findings), with

@@ -3313,6 +3313,11 @@ fn build_turn(
                         checks_passed: st.check_work_passed,
                         checks_report: st.check_report.clone(),
                         verifier: rep.status.to_string(),
+                        policy: st
+                            .check_plan
+                            .as_ref()
+                            .map(|p| tools::applied_policy(p, cwd, &st.changed_files))
+                            .unwrap_or_default(),
                     });
                     for r in crate::commands::commit_held() {
                         if let Err(e) = r {

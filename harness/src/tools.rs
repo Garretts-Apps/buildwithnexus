@@ -4704,6 +4704,64 @@ pub fn check_plan(cwd: &Path) -> CheckPlan {
     plan
 }
 
+// The changed files relative to `cwd`, with `/` separators, as check
+// `paths` globs and boundaries match them.
+fn relative_changed(cwd: &Path, changed: &[String]) -> Vec<String> {
+    changed
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .strip_prefix(cwd)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| f.replace('\\', "/"))
+        })
+        .collect()
+}
+
+// Whether a check is for one of the changed files (roadmap 4.3).
+fn check_applies(c: &WorkCheck, rels: &[String]) -> bool {
+    c.paths.is_empty()
+        || rels.iter().any(|r| {
+            let name = r.rsplit('/').next().unwrap_or(r);
+            c.paths
+                .iter()
+                .any(|g| crate::hooks::glob_match(g, r) || crate::hooks::glob_match(g, name))
+        })
+}
+
+/// The quality policy that applied to a turn's `changed` files (roadmap
+/// 5.6), for its evidence record: where the checks came from, each check
+/// and boundary that applied, the gates, and a digest of the whole pinned
+/// policy, so a commit records which policy it was made under.
+pub fn applied_policy(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Value {
+    let rels = relative_changed(cwd, changed);
+    let checks: Vec<Value> = pinned
+        .checks
+        .iter()
+        .filter(|c| check_applies(c, &rels))
+        .map(|c| serde_json::json!({"name": c.label, "kind": c.kind, "command": c.cmd, "paths": c.paths}))
+        .collect();
+    let boundaries: Vec<Value> = pinned
+        .boundaries
+        .iter()
+        .filter(|b| rels.iter().any(|r| b.from.iter().any(|g| crate::hooks::glob_match(g, r))))
+        .map(|b| serde_json::json!({"name": b.name, "from": b.from, "forbid": b.forbid, "why": b.why}))
+        .collect();
+    let digest: String =
+        ring::digest::digest(&ring::digest::SHA256, format!("{pinned:?}").as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+    serde_json::json!({
+        "source": if pinned.configured { "settings" } else { "detected" },
+        "checks": checks,
+        "gates": pinned.gates.iter().map(|(c, _)| c.label.clone()).collect::<Vec<_>>(),
+        "boundaries": boundaries,
+        "digest": digest,
+    })
+}
+
 /// The boundary breaks in the changed files `rels` (relative paths): each
 /// as `file:line uses `text` (boundary: why)`.
 pub fn boundary_breaks(
@@ -4840,24 +4898,8 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Out
     }
     // A check for some files only runs when one of them changed (roadmap
     // 4.3): matched against each changed file's path and name.
-    let rels: Vec<String> = changed
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .strip_prefix(cwd)
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| f.replace('\\', "/"))
-        })
-        .collect();
-    let applies = |c: &WorkCheck| {
-        c.paths.is_empty()
-            || rels.iter().any(|r| {
-                let name = r.rsplit('/').next().unwrap_or(r);
-                c.paths
-                    .iter()
-                    .any(|g| crate::hooks::glob_match(g, r) || crate::hooks::glob_match(g, name))
-            })
-    };
+    let rels = relative_changed(cwd, changed);
+    let applies = |c: &WorkCheck| check_applies(c, &rels);
     // Architectural boundaries (roadmap 5.7): a break fails the round like
     // a failing check, whatever else ran.
     let breaks = boundary_breaks(&pinned.boundaries, cwd, &rels);

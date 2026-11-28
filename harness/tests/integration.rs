@@ -13280,3 +13280,86 @@ fn a_seeded_boundary_break_blocks() {
     let r = go("src/db/pool.rs", "use crate::db::Pool;\n");
     assert!(r.success, "{}", r.text_of("tool_result"));
 }
+
+// Roadmap 5.6 (SD-5): the commit records which quality policy applied. The
+// evidence record names the checks that applied to the changed files (a
+// stylesheet change: the styles check, not the scripts one), where they
+// came from and a digest of the whole pinned policy; `evidence verify`
+// shows it.
+#[test]
+fn the_commit_records_which_policy_applied() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join("base.txt"), "b").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "style.css", "content": "body { color: red }\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    let pass = if cfg!(windows) { "exit 0" } else { "true" };
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "off", "auto_commit": true,
+            "checks": [
+                {"name": "styles", "command": pass, "paths": ["*.css"]},
+                {"name": "scripts", "command": pass, "paths": ["*.js"]},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "restyle");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let out = Command::new(BIN)
+        .args(["evidence", "verify", "HEAD"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("policy ") && said.contains("(settings: styles)"),
+        "{said}"
+    );
+    let body = g(&["log", "-1", "--format=%B"]);
+    let hash = body
+        .lines()
+        .find_map(|l| l.strip_prefix("Bwn-Evidence:"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let rec: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join("evidence").join(format!("{hash}.json"))).unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = rec["policy"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(names, ["styles"], "{rec}");
+    assert_eq!(rec["policy"]["source"], "settings");
+    assert_eq!(rec["policy"]["digest"].as_str().map(str::len), Some(64));
+}
