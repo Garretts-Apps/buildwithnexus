@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **The store-seal key is made once, even when two bwn start together.**
+  Without a keyring the key is a file; two processes (or a reader that
+  caught it half-written) could each make one, and the trust and
+  startup-check stores the first sealed then read as rewritten, so saved
+  trust was lost. It is now written whole and linked into place, and a
+  key file that doesn't read is never replaced.
 - **The `checks` setting names the checks that must pass (roadmap 3.1).**
   It replaces detection; `[]` means none. A project file's `checks` run
   code, so they wait for trust like its hooks, and the trust screen lists

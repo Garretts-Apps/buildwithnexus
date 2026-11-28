@@ -70,6 +70,12 @@ fn key() -> Option<(Vec<u8>, bool)> {
     if let Some(k) = existing.as_deref().and_then(decode) {
         return Some((k, false));
     }
+    // A key file that's there but doesn't read as a key is not replaced:
+    // nothing can be checked against it, and making a new one would make
+    // every sealed store read as rewritten.
+    if ring.is_none() && key_file().exists() {
+        return None;
+    }
     let mut fresh = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut fresh).ok()?;
     let hex: String = fresh.iter().map(|b| format!("{b:02x}")).collect();
@@ -77,7 +83,22 @@ fn key() -> Option<(Vec<u8>, bool)> {
         Some(k) => crate::audit::keyring_set(k, KEY_ACCOUNT, &hex),
         None => {
             crate::config::ensure_home();
-            write_private(&key_file(), &hex)
+            // Made whole beside it, then linked into place, which fails if
+            // a key is there already: two bwn starting at once (or a reader
+            // catching a half-written file) must not each make a key, or
+            // the stores the first sealed read as rewritten. The one that
+            // loses uses the key that won.
+            let tmp = key_file().with_extension(format!("key.{}", std::process::id()));
+            let linked = write_private(&tmp, &hex) && std::fs::hard_link(&tmp, key_file()).is_ok();
+            let _ = std::fs::remove_file(&tmp);
+            if !linked {
+                return std::fs::read_to_string(key_file())
+                    .ok()
+                    .as_deref()
+                    .and_then(decode)
+                    .map(|k| (k, false));
+            }
+            true
         }
     };
     if !saved {
@@ -244,6 +265,30 @@ mod tests {
 
     // I3 (roadmap 2.5): a store sealed by bwn and rewritten behind its back
     // reads as rewritten; its seal deleted, too; unchanged, sealed.
+    // Many threads making the key at once all end up with one key, so a
+    // store sealed by one checks as sealed for every other.
+    #[test]
+    fn the_seal_key_is_made_once_under_a_race() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-seal-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let keys: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16).map(|_| s.spawn(|| key().map(|(k, _)| k))).collect();
+            hs.into_iter().filter_map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(keys.len(), 16);
+        assert!(
+            keys.iter().all(|k| *k == keys[0]),
+            "more than one key was made"
+        );
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn invariant_i3_a_store_rewritten_outside_bwn_is_caught() {
         let _g = crate::config::TEST_ENV_LOCK
