@@ -135,11 +135,22 @@ pub fn set_mode(mode: Mode) {
 }
 
 pub fn mode() -> Mode {
+    #[cfg(test)]
+    if let Some(m) = TEST_MODE.with(|m| m.get()) {
+        return m;
+    }
     match MODE.load(Ordering::Relaxed) {
         1 => Mode::Auto,
         2 => Mode::Require,
         _ => Mode::Off,
     }
+}
+
+// A sandbox mode for one test thread, so a test that needs the sandbox on
+// doesn't switch it on under the tests running beside it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_MODE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
 }
 
 pub fn set_network(allowed: bool) {
@@ -1154,6 +1165,56 @@ pub fn wrap(cmd: &str, cwd: &Path) -> Result<Option<Command>, String> {
     wrap_in(mode(), cmd, cwd)
 }
 
+/// How an extension (a stdio MCP server, a hook) starts: inside the same
+/// sandbox as commands, running `program` with `args` in `cwd` (roadmap 2.4;
+/// analysis H1, H2). `unconfined` is the entry's own `"sandbox": false`,
+/// which the posture check names. With the sandbox off, or with no backend
+/// under `auto`, it runs as it did before (the posture check says so);
+/// under `require` with no backend it is refused. Inside the sandbox the
+/// credential variables are stripped, as for a command; outside, only when
+/// `scrub` (an MCP server: third-party code; a hook outside keeps the
+/// user's environment, as it always has). The caller adds the entry's own
+/// environment.
+pub fn extension_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    unconfined: bool,
+    scrub: bool,
+) -> Result<Command, String> {
+    let plain = || {
+        let mut c = Command::new(program);
+        c.args(args).current_dir(cwd);
+        if scrub {
+            scrub_credentials(&mut c);
+        }
+        c
+    };
+    if unconfined || mode() == Mode::Off {
+        return Ok(plain());
+    }
+    match decide(mode(), backend()) {
+        Decision::Sandboxed(b) => {
+            let script = std::iter::once(program)
+                .chain(args.iter().map(String::as_str))
+                .map(sh_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            command_for(b, &format!("exec {script}"), cwd)
+        }
+        _ if mode() == Mode::Require => Err(format!(
+            "sandbox: require, and no sandbox backend works here ({}); set \"sandbox\": false on this entry to run it unconfined",
+            backend_error().unwrap_or("no backend")
+        )),
+        _ => Ok(plain()),
+    }
+}
+
+// One shell word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// `wrap` under an explicit policy (tests, and callers that already read it).
 pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, String> {
     if mode == Mode::Off {
@@ -1854,10 +1915,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         // Outside the workspace AND outside /tmp (which the sandbox replaces
         // with a private tmpfs): the home directory, normally writable.
-        let outside_dir = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|h| h.is_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let outside_dir = test_home_base();
         let outside = outside_dir.join(format!("bwn-sandbox-escape-{id}.txt"));
         let _ = std::fs::remove_file(&outside);
         let run = |cmd: &str| {
@@ -1907,14 +1965,106 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    // A folder for test fixtures outside /tmp (bubblewrap replaces /tmp):
+    // the real home, read once. Tests that point HOME at a fake home run
+    // beside ones that read it, so every fixture takes its base from here.
+    pub(crate) fn test_home_base() -> PathBuf {
+        static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BASE.get_or_init(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
+                .unwrap_or_else(|| PathBuf::from("/var/tmp"))
+        })
+        .clone()
+    }
+
+    // IH-1 fixture (roadmap 2.4): a fake home (HOME points at it) with a
+    // credential store and a workspace, an "outside" folder beside them,
+    // and the sandbox in auto. Runs `f(home, ws, outside)` and restores
+    // everything. Returns false (and runs nothing) where no backend works,
+    // unless the CI cell forced one.
+    pub(crate) fn with_confined_home(tag: &str, f: impl FnOnce(&Path, &Path, &Path)) -> bool {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(b) = backend() else {
+            assert!(
+                !matches!(
+                    std::env::var("BWN_TEST_SANDBOX_BACKEND").as_deref(),
+                    Ok("bwrap" | "userns" | "landlock" | "seatbelt")
+                ),
+                "a backend was forced but none works"
+            );
+            return false;
+        };
+        let _ = b;
+        let base = crate::sandbox::tests::test_home_base();
+        let root = base.join(format!("bwn-ih1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_test"), "KEY-MATERIAL\n").unwrap();
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (home, outside) = (root.join("home"), root.join("outside"));
+        let ws = home.join("proj");
+        crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = Some(home.clone()));
+        TEST_MODE.with(|m| m.set(Some(Mode::Auto)));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&home, &ws, &outside)));
+        TEST_MODE.with(|m| m.set(None));
+        crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&root);
+        if let Err(e) = r {
+            std::panic::resume_unwind(e);
+        }
+        true
+    }
+
+    // IH-1 for extensions (roadmap 2.4): what a stdio MCP server or a hook
+    // starts through runs confined like a command: it can't write outside
+    // the workspace or read a credential store. `"sandbox": false` runs it
+    // as before.
+    #[cfg(unix)]
+    #[test]
+    fn invariant_ih1_an_extension_starts_inside_the_sandbox() {
+        let ran = with_confined_home("ext", |home, ws, outside| {
+            let script = format!(
+                "echo x > '{}/w.txt' 2>/dev/null; cat '{}/.ssh/id_test' 2>/dev/null; echo done",
+                outside.display(),
+                home.display()
+            );
+            let run = |unconfined: bool| {
+                extension_command(
+                    "sh",
+                    &["-c".to_string(), script.clone()],
+                    ws,
+                    unconfined,
+                    true,
+                )
+                .unwrap()
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+            };
+            let confined = run(false);
+            let out = String::from_utf8_lossy(&confined.stdout);
+            assert!(out.contains("done"), "{confined:?}");
+            assert!(!out.contains("KEY-MATERIAL"), "read the store: {out}");
+            assert!(!outside.join("w.txt").exists(), "wrote outside");
+            let open = run(true);
+            assert!(String::from_utf8_lossy(&open.stdout).contains("KEY-MATERIAL"));
+            assert!(outside.join("w.txt").exists());
+        });
+        eprintln!("ih1 extension ran: {ran}");
+    }
+
     // A home folder with credential stores, outside /tmp (bubblewrap
     // replaces /tmp, and Landlock lets commands write and read it).
     #[cfg(target_os = "linux")]
     fn fake_home(tag: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
-        let base = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
-            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+        let base = crate::sandbox::tests::test_home_base();
         let home = base.join(format!("bwn-hide-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".ssh")).unwrap();

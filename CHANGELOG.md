@@ -7,6 +7,32 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Stdio MCP servers and hooks start inside the sandbox.** They used to
+  run outside every control. Now a server's or hook's process gets what a
+  command gets: writes only in the workspace and temp folders, credential
+  stores hidden, and the network only through the checker.
+  - An entry with `"sandbox": false` runs outside it, and the posture
+    check names that entry.
+  - Hook scripts in `~/.buildwithnexus/hooks/` and compiled `.rs` hooks
+    still run outside, because the sandbox hides bwn's own folder. The
+    posture check names those too.
+  - **Breaking:** a server or hook that writes its own cache under your home
+    folder, or that reaches a host the checker doesn't allow (a chat
+    webhook, say), needs `"sandbox": false` on its entry. A hook inside the
+    sandbox also loses the provider keys commands lose. Under bubblewrap
+    its `/tmp` is private, so a file it writes there is gone afterwards.
+    Outside the sandbox a hook keeps your environment, as before.
+- **An empty `.git` folder no longer makes a folder a repository.** A
+  sandboxed command leaves one behind as the mount point that keeps it from
+  creating `.git`. bwn treated it as a repository root, as git does not:
+  instruction labels, patch paths and the trust screen then changed. With
+  hooks now sandboxed, a `SessionStart` hook made the trust screen ask about
+  a repo's instructions twice.
+- **File tools refuse hidden credential stores.** With the sandbox on,
+  `read_file` and the other file tools refuse `~/.ssh`, `~/.aws` and the
+  other hidden stores, as commands do, whatever a person answers.
+  `sandbox_expose` opens a store to both. bwn's own `skills`, `agents` and
+  `commands` folders stay readable.
 - **Background workflows can no longer run looser than the session that
   started them.** A workflow is a separate process, and it used to get only
   the permission mode and the added folders. It re-read the settings for

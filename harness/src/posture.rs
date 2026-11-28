@@ -383,27 +383,99 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
 
     let settings = crate::config::load_settings();
     // Servers that are switched on (`"enabled": false` ones never start).
-    let mcp: Vec<String> = settings
+    let mcp: Vec<(String, bool)> = settings
         .as_ref()
         .map(|s| {
             s.mcp_servers
                 .iter()
                 .filter(|(_, v)| v.get("enabled").and_then(|e| e.as_bool()) != Some(false))
-                .map(|(k, _)| k.clone())
+                .map(|(k, v)| {
+                    // An http server is a connection, not a process here.
+                    let stdio = v.get("url").is_none();
+                    let outside =
+                        stdio && v.get("sandbox").and_then(|b| b.as_bool()) == Some(false);
+                    (k.clone(), outside)
+                })
                 .collect()
         })
         .unwrap_or_default();
+    // Stdio servers and hooks start inside the sandbox (roadmap 2.4); with
+    // it off, or with no backend, they run as commands would.
+    let confining = crate::sandbox::would_confine();
+    let names: Vec<String> = mcp.iter().map(|(n, _)| n.clone()).collect();
+    let outside: Vec<String> = mcp
+        .iter()
+        .filter(|(_, o)| *o)
+        .map(|(n, _)| n.clone())
+        .collect();
     v.push(if mcp.is_empty() {
         row("session", "MCP servers", "none".into(), Level::Good, "none")
+    } else if !confining {
+        row(
+            "session",
+            "MCP servers",
+            format!(
+                "{} (outside any sandbox: none confines commands here)",
+                names.join(", ")
+            ),
+            Level::Warn,
+            &format!("unconfined:{}", names.join(",")),
+        )
+    } else if outside.is_empty() {
+        row(
+            "session",
+            "MCP servers",
+            format!(
+                "{} (stdio servers run inside the sandbox)",
+                names.join(", ")
+            ),
+            Level::Good,
+            &format!("confined:{}", names.join(",")),
+        )
     } else {
         row(
             "session",
             "MCP servers",
-            format!("{} (they run outside the sandbox)", mcp.join(", ")),
+            format!(
+                "{} (inside the sandbox, except {}, whose \"sandbox\": false runs it outside)",
+                names.join(", "),
+                outside.join(", ")
+            ),
             Level::Warn,
-            &mcp.join(","),
+            &format!("confined:{};outside:{}", names.join(","), outside.join(",")),
         )
     });
+    let (hook_count, hooks_outside) = crate::hooks::sandbox_summary();
+    if hook_count > 0 {
+        v.push(if !confining {
+            row(
+                "session",
+                "hooks",
+                format!("{hook_count} (outside any sandbox: none confines commands here)"),
+                Level::Warn,
+                "unconfined",
+            )
+        } else if hooks_outside.is_empty() {
+            row(
+                "session",
+                "hooks",
+                format!("{hook_count}, all inside the sandbox"),
+                Level::Good,
+                "confined",
+            )
+        } else {
+            row(
+                "session",
+                "hooks",
+                format!(
+                    "{hook_count}; outside the sandbox: {} (\"sandbox\": false, or a script in bwn's own folder, which the sandbox hides)",
+                    hooks_outside.join("; ")
+                ),
+                Level::Warn,
+                &format!("outside:{}", hooks_outside.join(";")),
+            )
+        });
+    }
     let untrusted = crate::config::untrusted_project_files(cwd);
     let project = cwd.join(".buildwithnexus");
     v.push(if !untrusted.is_empty() {

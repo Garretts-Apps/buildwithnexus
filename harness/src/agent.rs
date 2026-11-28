@@ -975,6 +975,69 @@ fn auto_asks(
     None
 }
 
+// Why a file tool may not touch one of `paths`: it lies in a credential store
+// the sandbox hides from commands. None with the sandbox off (the user chose
+// that) or nothing hidden.
+fn hidden_store_refusal(
+    paths: &[std::path::PathBuf],
+    cwd: &Path,
+    mutating: bool,
+) -> Option<String> {
+    if crate::sandbox::mode() == crate::sandbox::Mode::Off || paths.is_empty() {
+        return None;
+    }
+    let extra = crate::workdirs::list();
+    let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let roots: Vec<&Path> = std::iter::once(cwd_c.as_path())
+        .chain(extra.iter().map(|p| p.as_path()))
+        .collect();
+    let hidden = crate::sandbox::hidden_paths(&roots);
+    // bwn's own skills, agents and commands are instructions, not
+    // credentials: a folder skill's references are read with read_file.
+    let home = crate::config::home();
+    let home = home.canonicalize().unwrap_or(home);
+    let readable: Vec<std::path::PathBuf> = ["skills", "agents", "commands"]
+        .iter()
+        .map(|d| home.join(d))
+        .collect();
+    paths.iter().find_map(|p| {
+        let c = canonical_or_parent(p);
+        if !mutating && readable.iter().any(|r| c.starts_with(r)) {
+            return None;
+        }
+        let h = hidden.iter().find(|h| c.starts_with(h))?;
+        Some(format!(
+            "{} is in {}, a credential store hidden from commands; file tools follow the same policy. To let both read it, add it to \"sandbox_expose\" in settings.json.",
+            p.display(),
+            h.display()
+        ))
+    })
+}
+
+// A path resolved through symlinks; for one that doesn't exist yet, its
+// nearest existing parent resolved and the rest appended.
+fn canonical_or_parent(p: &Path) -> std::path::PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut tail = Vec::new();
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    p.to_path_buf()
+}
+
 pub(crate) fn gate(
     perm: Permission,
     name: &str,
@@ -1074,6 +1137,12 @@ pub(crate) fn gate(
                 cwd,
             );
         }
+    }
+    // File tools follow the same hidden-store policy as commands (roadmap
+    // 2.4): with the sandbox on, a credential store hidden from commands is
+    // refused to them too, whatever the answer would be.
+    if let Some(why) = hidden_store_refusal(&paths, cwd, tools::is_mutating_call(name, input)) {
+        return Some(why);
     }
     // A sensitive path is approved by itself: `s` and `a` cover that path,
     // not the tool or the command that reached it.

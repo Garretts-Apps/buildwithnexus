@@ -328,10 +328,7 @@ pub(crate) mod tests {
                 );
                 return None;
             }
-            let base = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
-                .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+            let base = crate::sandbox::tests::test_home_base();
             let home = base.join(format!("bwn-userns-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(home.join(".ssh")).unwrap();

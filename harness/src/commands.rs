@@ -688,7 +688,7 @@ pub(crate) fn commit_paths(
 fn git_work_tree(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dir = cwd.to_path_buf();
     loop {
-        if dir.join(".git").exists() {
+        if crate::config::is_git_marker(&dir.join(".git")) {
             return Some(dir);
         }
         if !dir.pop() {

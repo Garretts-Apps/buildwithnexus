@@ -123,6 +123,9 @@ struct Hook {
     // `"on_error": "deny"`: a PreToolUse guard that exits non-zero (other
     // than 2) blocks the call instead of letting it through with a warning.
     deny_on_error: bool,
+    // `"sandbox": false`: the hook runs outside the sandbox. It runs inside
+    // by default (roadmap 2.4), and the posture check names any that don't.
+    unconfined: bool,
     // Project hooks: the project files the hook runs, as they were when the
     // folder was trusted, checked again before every run.
     pins: Mutex<Vec<Pin>>,
@@ -280,6 +283,7 @@ pub fn init(cwd: &Path, interactive: bool) {
                 source: Source::Home,
                 timeout: Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS),
                 deny_on_error: false,
+                unconfined: false,
                 pins: Mutex::new(Vec::new()),
                 refused: Mutex::new(None),
             });
@@ -308,6 +312,41 @@ pub fn init(cwd: &Path, interactive: bool) {
 
 /// Hook settings problems found at startup, once: the REPL shows them after
 /// the banner (they would be lost behind the alternate screen otherwise).
+/// For the posture check (roadmap 2.4): how many command and script hooks
+/// are loaded, and a short label for each that runs outside the sandbox
+/// (`"sandbox": false`, or a program in bwn's own folder, which the sandbox
+/// hides). HTTP hooks are bwn's own requests, not processes.
+pub fn sandbox_summary() -> (usize, Vec<String>) {
+    let Some(h) = HOOKS.get() else {
+        return (0, Vec::new());
+    };
+    let mut count = 0;
+    let mut outside = Vec::new();
+    for hk in &h.list {
+        let label = match &hk.cmd {
+            HookCmd::Http { .. } => continue,
+            HookCmd::Shell(s) => {
+                count += 1;
+                if !hk.unconfined {
+                    continue;
+                }
+                trace::preview(&shown(s), 40)
+            }
+            HookCmd::Script(p) => {
+                count += 1;
+                if !hk.unconfined && !in_bwn_home(p) {
+                    continue;
+                }
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        };
+        outside.push(format!("{} {label}", hk.event));
+    }
+    (count, outside)
+}
+
 pub fn take_startup_issues() -> Vec<String> {
     STARTUP_ISSUES
         .lock()
@@ -409,6 +448,16 @@ fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut V
                         false
                     }
                 };
+                let unconfined = match &h["sandbox"] {
+                    Value::Null | Value::Bool(true) => false,
+                    Value::Bool(false) => true,
+                    _ => {
+                        issues.push(format!(
+                            "sandbox in a {event} hook must be true or false — running it inside the sandbox"
+                        ));
+                        false
+                    }
+                };
                 out.push(Hook {
                     event: event.clone(),
                     matcher: matcher.clone(),
@@ -416,6 +465,7 @@ fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut V
                     source,
                     timeout: Duration::from_secs(timeout),
                     deny_on_error,
+                    unconfined,
                     pins: Mutex::new(Vec::new()),
                     refused: Mutex::new(None),
                 });
@@ -782,6 +832,7 @@ struct Selected {
     matcher: String,
     timeout: Duration,
     deny_on_error: bool,
+    unconfined: bool,
 }
 
 // The hooks for `event`; for a tool event, those whose matcher covers the
@@ -813,6 +864,7 @@ fn select_hooks(list: &[Hook], event: &str, call: Option<(&str, &Value)>) -> Vec
             matcher: hk.matcher.clone(),
             timeout: hk.timeout,
             deny_on_error: hk.deny_on_error,
+            unconfined: hk.unconfined,
         })
         .collect()
 }
@@ -2290,10 +2342,16 @@ fn interpreter_for_ext(
     }
 }
 
-fn run_hook_cmd(cmd: &HookCmd, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
+fn run_hook_cmd(
+    cmd: &HookCmd,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+    unconfined: bool,
+) -> HookRun {
     match cmd {
-        HookCmd::Shell(s) => run_shell(s, payload, cwd, timeout),
-        HookCmd::Script(path) => run_script(path, payload, cwd, timeout),
+        HookCmd::Shell(s) => run_shell(s, payload, cwd, timeout, unconfined),
+        HookCmd::Script(path) => run_script(path, payload, cwd, timeout, unconfined),
         HookCmd::Http { url, headers } => run_http(url, headers, payload, cwd, timeout),
     }
 }
@@ -2389,15 +2447,43 @@ fn first_line(s: &str) -> &str {
         .unwrap_or("")
 }
 
-fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
-    let mut c = if cfg!(windows) {
-        let mut x = Command::new("cmd");
-        x.args(["/C", cmd]);
-        x
+// The hook's process: inside the sandbox unless `unconfined` (roadmap 2.4).
+fn hook_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    unconfined: bool,
+) -> Result<Command, HookRun> {
+    crate::sandbox::extension_command(program, args, cwd, unconfined, false)
+        .map_err(HookRun::not_started)
+}
+
+// A program in bwn's own folder (a hook discovered in ~/.buildwithnexus/hooks,
+// a compiled Rust hook): the sandbox hides that folder from what it runs, so
+// it runs outside, and the posture check says so.
+fn in_bwn_home(p: &Path) -> bool {
+    let home = config::home();
+    let home = home.canonicalize().unwrap_or(home);
+    p.canonicalize()
+        .unwrap_or_else(|_| p.to_path_buf())
+        .starts_with(&home)
+}
+
+fn run_shell(
+    cmd: &str,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+    unconfined: bool,
+) -> HookRun {
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/C".to_string(), cmd.to_string()])
     } else {
-        let mut x = Command::new("sh");
-        x.args(["-c", cmd]);
-        x
+        ("sh", vec!["-c".to_string(), cmd.to_string()])
+    };
+    let mut c = match hook_command(program, &args, cwd, unconfined) {
+        Ok(c) => c,
+        Err(run) => return run,
     };
     let mut run = run_child(
         c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
@@ -2414,7 +2500,13 @@ fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> HookR
     run
 }
 
-fn run_script(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
+fn run_script(
+    path: &Path,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+    unconfined: bool,
+) -> HookRun {
     // Checked here: the interpreter would report a missing or unreadable
     // script as an ordinary exit status (bash 127, dash 2).
     let full = cwd.join(path);
@@ -2423,18 +2515,20 @@ fn run_script(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> Ho
         Ok(m) if !m.is_file() => return HookRun::not_started("not a file".into()),
         Ok(_) => {}
     }
+    let unconfined = unconfined || in_bwn_home(&full);
     if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
-        return run_rust_hook(&full, payload, cwd, timeout);
+        return run_rust_hook(&full, payload, cwd, timeout, unconfined);
     }
     let (interp, interp_args) = match interpreter_for(path) {
         Ok(i) => i,
         Err(e) => return HookRun::not_started(e),
     };
-    let mut c = Command::new(interp);
-    for a in interp_args {
-        c.arg(a);
-    }
-    c.arg(path);
+    let mut args: Vec<String> = interp_args.iter().map(|a| a.to_string()).collect();
+    args.push(path.to_string_lossy().into_owned());
+    let mut c = match hook_command(interp, &args, cwd, unconfined) {
+        Ok(c) => c,
+        Err(run) => return run,
+    };
     run_child(
         c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
         payload,
@@ -2442,7 +2536,13 @@ fn run_script(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> Ho
     )
 }
 
-fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
+fn run_rust_hook(
+    path: &Path,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+    unconfined: bool,
+) -> HookRun {
     if Command::new("rust-script")
         .arg("--version")
         .stdout(Stdio::null())
@@ -2450,8 +2550,15 @@ fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) ->
         .status()
         .is_ok()
     {
-        let mut c = Command::new("rust-script");
-        c.arg(path);
+        let mut c = match hook_command(
+            "rust-script",
+            &[path.to_string_lossy().into_owned()],
+            cwd,
+            unconfined,
+        ) {
+            Ok(c) => c,
+            Err(run) => return run,
+        };
         return run_child(
             c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
             payload,
@@ -2766,7 +2873,7 @@ fn run_selected(
         format!("{title} {}", cmd_label(&s.cmd)),
         with_fields(fields.clone(), json!({"trigger": payload})),
     );
-    let run = run_hook_cmd(&s.cmd, payload, cwd, s.timeout);
+    let run = run_hook_cmd(&s.cmd, payload, cwd, s.timeout, s.unconfined);
     trace::record_visible(
         "hook_result",
         format!("{title} {}", run.status()),
@@ -3901,6 +4008,42 @@ mod tests {
         assert_eq!(run.status(), "was killed by signal 9");
     }
 
+    // IH-1 for hooks (roadmap 2.4): a command hook runs inside the sandbox
+    // by default, so it can't write outside the workspace or read a
+    // credential store; `"sandbox": false` runs it as before.
+    #[test]
+    #[cfg(unix)]
+    fn invariant_ih1_a_hook_runs_inside_the_sandbox() {
+        crate::sandbox::tests::with_confined_home("hook", |home, ws, outside| {
+            let cmd = format!(
+                "echo x > '{}/w.txt' 2>/dev/null; cat '{}/.ssh/id_test' 2>/dev/null; echo done",
+                outside.display(),
+                home.display()
+            );
+            let confined = run_shell(&cmd, &json!({}), ws, Duration::from_secs(10), false);
+            assert!(confined.stdout.contains("done"), "{:?}", confined.stdout);
+            assert!(!confined.stdout.contains("KEY-MATERIAL"), "read the store");
+            assert!(!outside.join("w.txt").exists(), "wrote outside");
+            let open = run_shell(&cmd, &json!({}), ws, Duration::from_secs(10), true);
+            assert!(open.stdout.contains("KEY-MATERIAL"));
+        });
+    }
+
+    #[test]
+    fn a_hooks_sandbox_key_is_read() {
+        let mut issues = Vec::new();
+        let mut out = Vec::new();
+        let v = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "true", "sandbox": false},
+            {"type": "command", "command": "true"},
+            {"type": "command", "command": "true", "sandbox": "no"}
+        ]}]}});
+        parse_checked(&v.to_string(), Source::Home, &mut out, &mut issues);
+        let unconfined: Vec<bool> = out.iter().map(|h| h.unconfined).collect();
+        assert_eq!(unconfined, [true, false, false]);
+        assert!(issues.iter().any(|i| i.contains("sandbox")), "{issues:?}");
+    }
+
     #[test]
     #[cfg(unix)]
     fn run_child_captures_output_within_timeout() {
@@ -4223,7 +4366,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/"),
             headers: Vec::new(),
         };
-        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5), false);
         assert!(run.failure.is_none() && run.code == 1, "{}", run.status());
         assert_eq!(
             problem_message("Stop", Source::Home, &cmd, &run).as_deref(),
@@ -4236,7 +4379,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/"),
             headers: Vec::new(),
         };
-        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5), false);
         let m = problem_message("Stop", Source::Home, &cmd, &run).unwrap();
         assert!(
             m.contains("answered HTTP 302 (redirects are not followed") && !m.contains("exited"),
@@ -4358,7 +4501,7 @@ mod tests {
         assert_eq!(r, Ok(String::new()));
 
         let cmd = HookCmd::Script(missing.clone());
-        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5), false);
         let msg = problem_message("PostToolUse", Source::Home, &cmd, &run).unwrap();
         assert!(
             msg.contains("PostToolUse hook") && msg.contains("could not start"),

@@ -872,7 +872,7 @@ fn mcp_server_failure_is_a_notice_not_a_crash() {
         "disabled servers stay silent: {notices}"
     );
     assert!(
-        notices.contains("MCP servers") && notices.contains("ghost (they run"),
+        notices.contains("MCP servers") && notices.contains("ghost (outside any sandbox"),
         "{notices}"
     );
 }
@@ -7118,7 +7118,8 @@ fn a_stop_hook_never_sends_on_a_prompt_a_hook_blocked() {
 fn a_subagent_stop_hook_sends_the_helper_on() {
     let home = tmp("home");
     let cwd = tmp("proj");
-    let count = home.join("count");
+    // In the workspace, which the hook may write inside the sandbox.
+    let count = cwd.join("count");
     let hook_cmd = format!(
         "cat > /dev/null; echo x >> {c}; [ $(wc -l < {c}) -ge 2 ] && exit 0; echo 'add a test as well' >&2; exit 2",
         c = count.display()
@@ -7221,8 +7222,9 @@ fn pre_compact_fires_before_automatic_compaction() {
     let marker = home.join("compact.json");
     write_hooks(
         &home,
+        // Outside the sandbox: the marker is in bwn's own (hidden) folder.
         json!({"PreCompact": [{ "matcher": "auto", "hooks": [{ "type": "command",
-            "command": format!("cat > {}", marker.display()) }] }]}),
+            "command": format!("cat > {}", marker.display()), "sandbox": false }] }]}),
     );
     // Four reads of ~5k tokens each fill a 16k window past its 80% mark.
     let mut script = Vec::new();
@@ -10363,6 +10365,7 @@ fn unreviewed_repo_instructions_are_one_stderr_line_headless() {
     let home = tmp("home");
     let cwd = tmp("proj");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::write(cwd.join("AGENTS.md"), "# Rules\nalways use tabs\n").unwrap();
     let note = "instructions from this repo: AGENTS.md (not reviewed";
     let port = serve_streaming(vec![finish("ok")]);

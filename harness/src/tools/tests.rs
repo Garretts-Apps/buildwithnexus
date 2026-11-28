@@ -2651,6 +2651,7 @@ fn a_patch_names_every_file_it_touches() {
     // git apply reads the names from the top of the work tree.
     let d = tempdir();
     fs::create_dir_all(d.join(".git")).unwrap();
+    fs::write(d.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::create_dir_all(d.join("sub")).unwrap();
     let input = json!({"patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-a\n+b\n"});
     let paths = touched_paths("apply_patch", &input, &d.join("sub"));

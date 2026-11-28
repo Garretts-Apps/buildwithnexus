@@ -4154,17 +4154,12 @@ fn invariant_a_store_holding_the_workspace_is_never_claimed_hidden() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let base = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"));
+    let base = crate::sandbox::tests::test_home_base();
     let fake = base.join(format!("bwn-store-ws-{}", std::process::id()));
     let ws = fake.join(".aws/proj");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(fake.join(".aws/credentials"), "KEY\n").unwrap();
-    let (home0, profile0) = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
-    std::env::set_var("HOME", &fake);
-    std::env::set_var("USERPROFILE", &fake);
+    crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = Some(fake.clone()));
     let mode0 = crate::sandbox::mode();
     crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
     let hides = crate::sandbox::hides_reads(&ws);
@@ -4176,15 +4171,68 @@ fn invariant_a_store_holding_the_workspace_is_never_claimed_hidden() {
     )
     .unwrap_or_default();
     crate::sandbox::set_mode(mode0);
-    for (k, v) in [("HOME", home0), ("USERPROFILE", profile0)] {
-        match v {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        }
-    }
+    crate::config::TEST_USER_HOME.with(|h| *h.borrow_mut() = None);
     let _ = std::fs::remove_dir_all(&fake);
     assert!(!hides, "claimed to hide a store that holds the workspace");
     if crate::sandbox::would_confine() {
         assert!(!reason.is_empty(), "auto mode did not ask");
+    }
+}
+
+// IH-1 for file tools (roadmap 2.4): with the sandbox on, a credential store
+// hidden from commands is refused to read_file too, in every mode and
+// whatever a person would answer. With the sandbox off the old prompt
+// decides.
+#[cfg(unix)]
+#[test]
+fn invariant_ih1_file_tools_follow_the_hidden_store_policy() {
+    crate::sandbox::tests::with_confined_home("files", |home, ws, _| {
+        let key = home.join(".ssh/id_test");
+        let input = json!({"path": key.to_string_lossy()});
+        for perm in [Permission::Auto, Permission::Ask, Permission::ReadOnly] {
+            let reason = gate(perm, "read_file", &input, ws).unwrap_or_default();
+            assert!(
+                reason.contains("credential store hidden from commands"),
+                "{perm:?}: {reason:?}"
+            );
+        }
+        crate::sandbox::TEST_MODE.with(|m| m.set(Some(crate::sandbox::Mode::Off)));
+        let off = gate(Permission::Auto, "read_file", &input, ws).unwrap_or_default();
+        crate::sandbox::TEST_MODE.with(|m| m.set(Some(crate::sandbox::Mode::Auto)));
+        assert!(!off.contains("credential store hidden"), "{off:?}");
+    });
+}
+
+// Roadmap 2.4: the posture check names a stdio MCP server whose entry runs
+// it outside the sandbox, and its key changes with that, so the posture
+// question is asked again when an entry is widened.
+#[test]
+fn the_posture_check_names_an_mcp_server_run_outside_the_sandbox() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mode0 = crate::sandbox::mode();
+    crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+    let row = |servers: serde_json::Value| {
+        let (home, proj) = rules_home("mcp-row", json!({ "mcp_servers": servers }));
+        crate::config::invalidate_settings_cache();
+        let rows = crate::posture::gather_session_rows_for_test(Permission::Ask, &proj);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        crate::config::invalidate_settings_cache();
+        rows.into_iter()
+            .find(|r| r.item == "MCP servers")
+            .map(|r| (r.value, r.key))
+            .unwrap()
+    };
+    let inside = row(json!({"a": {"command": "x"}}));
+    let widened = row(json!({"a": {"command": "x", "sandbox": false}}));
+    crate::sandbox::set_mode(mode0);
+    if crate::sandbox::would_confine() || crate::sandbox::backend().is_some() {
+        assert!(inside.0.contains("inside the sandbox"), "{inside:?}");
+        assert!(widened.0.contains("except a"), "{widened:?}");
+        assert_ne!(inside.1, widened.1, "widening must change the key");
+    } else {
+        assert!(inside.0.contains("outside any sandbox"), "{inside:?}");
     }
 }
