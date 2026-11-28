@@ -635,7 +635,7 @@ jobs:
       # unready `ollama serve`, npm prefixes that break nvm). Warnings print
       # but only errors fail the job.
       - name: Lint README and SECURITY.md command blocks
-        run: node scripts/field/lint-blocks.mjs README.md SECURITY.md docs/hooks.md docs/skills.md docs/editors.md docs/platforms.md docs/images.md docs/instructions.md docs/checks.md
+        run: node scripts/field/lint-blocks.mjs README.md SECURITY.md docs/hooks.md docs/skills.md docs/editors.md docs/platforms.md docs/images.md docs/instructions.md docs/checks.md docs/providers.md
 
       # npm cuts the README at 65536 UTF-16 code units, and crates.io 404s a
       # relative file link because the crate lives in harness/.

@@ -74,6 +74,7 @@ fn an_edit_in_a_conversational_turn_is_asked_about_before_undo_overwrites_it() {
         max_tokens: None,
         effort: config::Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     // The chat turn's own loop (run_chat_turn also names the session,
     // which is process-wide state other tests read).
@@ -1895,6 +1896,7 @@ fn compaction_carries_only_the_images_that_fit_the_context() {
         max_tokens: None,
         effort: config::Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let budget = p.context_tokens * 8 / 10;
     let mut msgs = screenshots_then_tail();

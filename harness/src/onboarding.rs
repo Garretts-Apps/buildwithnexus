@@ -156,6 +156,24 @@ fn pick_provider(ollama_found: bool) -> Option<&'static Preset> {
 // anything is written.
 fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings, Exit> {
     let mut base_url = None;
+    // A cloud preset's endpoint is the user's own resource.
+    if pick.base_url.is_empty() {
+        loop {
+            let u = ask(&format!(
+                "  your {} endpoint (https://NAME{}/openai/v1): ",
+                pick.label,
+                config::cloud_hosts(pick.id).first().unwrap_or(&"")
+            ))?;
+            match config::cloud_endpoint_ok(pick.id, &u) {
+                Ok(()) if !u.is_empty() => {
+                    base_url = Some(u);
+                    break;
+                }
+                Ok(()) => {}
+                Err(why) => tui::line(&tui::red(&format!("  {why}"))),
+            }
+        }
+    }
     if pick.local {
         let u = ask(&format!("  endpoint [{}]: ", pick.base_url))?;
         if !u.is_empty() {
@@ -687,6 +705,7 @@ fn key_page(provider: &str) -> Option<&'static str> {
         "xai" => "https://console.x.ai/",
         "mistral" => "https://console.mistral.ai/api-keys",
         "deepseek" => "https://platform.deepseek.com/api_keys",
+        "azure" => "https://ai.azure.com (your resource's Keys and Endpoint)",
         _ => return None,
     })
 }

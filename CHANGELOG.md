@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Azure OpenAI (Foundry), with its key bound to Azure (roadmap 4.4).**
+  `"provider": "azure"` with your resource's v1 endpoint as `base_url`
+  sends `AZURE_OPENAI_API_KEY` in the `api-key` header, and only to a host
+  under `.openai.azure.com`, `.services.ai.azure.com` or
+  `.cognitiveservices.azure.com` over HTTPS. A look-alike host gets no key.
+  See [Cloud providers](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/providers.md).
 - **Language-server diagnostics after an edit.** `"lsp": {"rust":
   {"command": "rust-analyzer", "extensions": ["rs"]}}` starts the server
   (inside the sandbox) the first time a file it serves is edited, and adds

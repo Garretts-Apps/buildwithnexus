@@ -111,6 +111,7 @@ fn provider_for(base_url: &str, key: Option<&str>) -> Provider {
         max_tokens: None,
         effort: crate::config::Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 
@@ -463,6 +464,7 @@ fn a_stalled_response_names_the_read_timeout_setting() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let m = explain_failure(
         &p,
@@ -547,6 +549,7 @@ fn validate_passes_on_ok_and_reports_auth_and_connect_failures() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     assert!(validate(&p).is_ok(), "200 must validate");
     let err = validate(&p).unwrap_err();
@@ -1349,6 +1352,7 @@ fn ollama_retries_without_tools_when_the_model_has_none_and_remembers() {
         effort: Effort::Off,
         // Pre-seeded so no /api/show probe consumes a scripted reply.
         ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",
@@ -1399,6 +1403,7 @@ fn ollama_retries_without_thinking_when_the_model_has_none_and_remembers() {
         max_tokens: None,
         effort: Effort::High,
         ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        auth: Default::default(),
     };
     let msgs = [Msg::User("hi".into())];
     assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
@@ -1804,6 +1809,7 @@ fn redirect_is_refused_and_key_never_reaches_the_other_host() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let err = complete(&p, &[Msg::User("hi".into())], &[]).unwrap_err();
     handle.join().unwrap();
@@ -2366,6 +2372,7 @@ fn ollama_at(base: String, model: &str) -> Provider {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 
@@ -2687,6 +2694,7 @@ fn request_records_every_completed_reply_into_the_ledger() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let before = crate::usage::snapshot();
     complete(&p, &[Msg::User("ping".into())], &[]).unwrap();
@@ -2902,6 +2910,7 @@ fn loopback_sends_native_tools_first_then_flattens_after_400_and_remembers() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",
@@ -2952,6 +2961,7 @@ fn loopback_keeps_native_tools_when_the_server_accepts_them() {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     };
     let tools = vec![ToolDef {
         name: "read_file",

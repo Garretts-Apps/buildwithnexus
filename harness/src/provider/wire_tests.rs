@@ -21,6 +21,7 @@ fn provider(protocol: Protocol, model: &str) -> Provider {
         max_tokens: None,
         effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: Default::default(),
     }
 }
 

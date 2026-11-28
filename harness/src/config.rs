@@ -137,6 +137,19 @@ pub const PRESETS: &[Preset] = &[
         more_models: &["deepseek-v4-pro"],
         local: false,
     },
+    // Azure OpenAI (Foundry) v1. There is no default endpoint: it is the
+    // user's resource, and the key goes only to an Azure host (roadmap 4.4).
+    // The model is the deployment's name.
+    Preset {
+        id: "azure",
+        label: "Azure OpenAI (Foundry)",
+        protocol: Protocol::OpenAi,
+        base_url: "",
+        env_key: "AZURE_OPENAI_API_KEY",
+        default_model: "gpt-4o",
+        more_models: &[],
+        local: false,
+    },
     Preset {
         id: "ollama",
         label: "Ollama (local)",
@@ -3676,6 +3689,53 @@ fn write_keys_file(map: &BTreeMap<String, String>) {
     write_atomic(&keys_path(), &body, true);
 }
 
+/// The hosts a cloud preset's credential may go to (roadmap 4.4): a name
+/// under one of these suffixes, with a label of its own in front.
+pub fn cloud_hosts(preset_id: &str) -> &'static [&'static str] {
+    match preset_id {
+        "azure" => &[
+            ".openai.azure.com",
+            ".services.ai.azure.com",
+            ".cognitiveservices.azure.com",
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether `url` is an endpoint `preset_id`'s credential may be sent to:
+/// HTTPS on the default port, no user name or password, and a host under
+/// one of its `cloud_hosts`. A preset with none has no such binding.
+pub fn cloud_endpoint_ok(preset_id: &str, url: &str) -> Result<(), String> {
+    let suffixes = cloud_hosts(preset_id);
+    if suffixes.is_empty() {
+        return Ok(());
+    }
+    let bad = || {
+        format!(
+            "{url} is not a {preset_id} endpoint (https://NAME{} …), so its key isn't sent there",
+            suffixes[0]
+        )
+    };
+    let u = url::Url::parse(url.trim()).map_err(|_| bad())?;
+    let host = match u.host() {
+        Some(url::Host::Domain(h)) => h.to_ascii_lowercase(),
+        _ => return Err(bad()),
+    };
+    let under = suffixes.iter().any(|s| {
+        host.strip_suffix(s)
+            .is_some_and(|label| !label.is_empty() && !label.ends_with('.'))
+    });
+    if u.scheme() != "https"
+        || u.port().is_some_and(|p| p != 443)
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || !under
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 /// `scheme://host[:port]` of a URL, lowercased, without credentials, path
 /// or the scheme's default port: the endpoint a custom key belongs to.
 /// Read the way the HTTP client reads it, so `http://a\\@b/` is `a`.
@@ -4655,7 +4715,14 @@ mod tests {
     #[test]
     fn remote_presets_use_https() {
         for p in PRESETS.iter().filter(|p| !p.local) {
-            assert!(p.base_url.starts_with("https://"), "{} not https", p.id);
+            // A cloud preset has no endpoint of its own: it is the user's
+            // resource, bound to the cloud's hosts.
+            assert!(
+                p.base_url.starts_with("https://")
+                    || (p.base_url.is_empty() && !cloud_hosts(p.id).is_empty()),
+                "{} not https",
+                p.id
+            );
             assert!(!p.env_key.is_empty(), "{} missing env_key", p.id);
         }
     }

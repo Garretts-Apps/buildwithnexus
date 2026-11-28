@@ -1152,8 +1152,17 @@ fn build_provider_deferring(
             ));
         }
         Some(u) => u.clone(),
+        None if preset.base_url.is_empty() => {
+            return Err(format!(
+                "{} needs base_url: your resource's endpoint, e.g. https://NAME{}/openai/v1",
+                preset.id,
+                config::cloud_hosts(preset.id).first().unwrap_or(&"")
+            ));
+        }
         None => preset.base_url.to_string(),
     };
+    config::cloud_endpoint_ok(preset.id, &base_url)
+        .map_err(|why| format!("refusing to send {}: {why}", preset.env_key))?;
     let model = if s.model.is_empty() {
         preset.default_model.to_string()
     } else {
@@ -1238,6 +1247,11 @@ fn build_provider_deferring(
         // rejecting the whole settings file.
         effort: config::Effort::parse(&s.effort).unwrap_or_default(),
         ollama_ctx: std::sync::OnceLock::new(),
+        auth: if preset.id == "azure" {
+            provider::Auth::AzureKey
+        } else {
+            provider::Auth::Standard
+        },
     };
     if let Some(n) = s.context_tokens {
         if provider.protocol == config::Protocol::OllamaNative {
