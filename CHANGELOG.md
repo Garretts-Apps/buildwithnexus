@@ -22,6 +22,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     sandbox also loses the provider keys commands lose. Under bubblewrap
     its `/tmp` is private, so a file it writes there is gone afterwards.
     Outside the sandbox a hook keeps your environment, as before.
+- **An empty `.git` folder no longer makes a folder a repository.** A
+  sandboxed command leaves one behind as the mount point that keeps it from
+  creating `.git`. bwn treated it as a repository root, as git does not:
+  instruction labels, patch paths and the trust screen then changed. With
+  hooks now sandboxed, a `SessionStart` hook made the trust screen ask about
+  a repo's instructions twice.
 - **File tools refuse hidden credential stores.** With the sandbox on,
   `read_file` and the other file tools refuse `~/.ssh`, `~/.aws` and the
   other hidden stores, as commands do, whatever a person answers.

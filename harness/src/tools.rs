@@ -2131,7 +2131,7 @@ pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
 // `cwd` itself.
 fn git_top(cwd: &Path) -> PathBuf {
     cwd.ancestors()
-        .find(|d| d.join(".git").exists())
+        .find(|d| crate::config::is_git_marker(&d.join(".git")))
         .unwrap_or(cwd)
         .to_path_buf()
 }

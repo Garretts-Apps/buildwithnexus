@@ -966,10 +966,22 @@ pub struct InstructionFile {
 }
 
 /// Nearest ancestor of `start` (inclusive) that contains a `.git` entry.
+/// Whether `dot_git` marks a repository the way git reads it: a `.git` file
+/// (a worktree or submodule's `gitdir:` pointer) or a `.git` folder holding
+/// `HEAD`. An empty `.git` folder is not one; a sandbox leaves one behind
+/// as the mount point that keeps commands from creating `.git`.
+pub fn is_git_marker(dot_git: &Path) -> bool {
+    match dot_git.symlink_metadata() {
+        Ok(m) if m.is_file() => true,
+        Ok(_) => dot_git.join("HEAD").exists(),
+        Err(_) => false,
+    }
+}
+
 pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|d| d.join(".git").exists())
+        .find(|d| is_git_marker(&d.join(".git")))
         .map(Path::to_path_buf)
 }
 
@@ -3869,6 +3881,28 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 #[cfg(test)]
 mod tests {
+
+    // A sandbox leaves an empty `.git` folder as the mount point that keeps
+    // commands from creating `.git`. That is not a repository: before this
+    // a sandboxed SessionStart hook turned a plain folder into a "git root"
+    // and the trust screen asked about its instructions a second time.
+    #[test]
+    fn an_empty_git_folder_is_not_a_repository() {
+        let d = std::env::temp_dir().join(format!("bwn-gitmark-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("plain/.git")).unwrap();
+        fs::create_dir_all(d.join("repo/.git")).unwrap();
+        fs::write(d.join("repo/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(d.join("wt")).unwrap();
+        fs::write(d.join("wt/.git"), "gitdir: ../repo/.git\n").unwrap();
+        assert!(!is_git_marker(&d.join("plain/.git")));
+        assert!(is_git_marker(&d.join("repo/.git")));
+        assert!(is_git_marker(&d.join("wt/.git")));
+        assert!(!is_git_marker(&d.join("missing/.git")));
+        assert_eq!(find_git_root(&d.join("plain")), None.or(find_git_root(&d)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 
@@ -5064,6 +5098,7 @@ mod tests {
         write(&outer.join("AGENTS.md"), "ABOVE THE GIT ROOT");
         let root = outer.join("repo");
         fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         write(&root.join("AGENTS.md"), "root agents");
         write(&root.join("CLAUDE.md"), "root claude (shadowed)");
         write(&root.join("sub").join("CLAUDE.md"), "sub claude");
@@ -5668,6 +5703,7 @@ mod tests {
         let other = h.join("other");
         for p in [&proj, &other] {
             fs::create_dir_all(p.join(".git")).unwrap();
+            fs::write(p.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
             fs::write(p.join("AGENTS.md"), "# Rules\nalways use tabs\n").unwrap();
         }
         fs::create_dir_all(h.join("home")).unwrap();

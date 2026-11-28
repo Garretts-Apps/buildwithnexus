@@ -32,7 +32,7 @@ impl Ignores {
         let mut in_git = false;
         while let Some(d) = dir {
             chain.push(d.to_path_buf());
-            if d.join(".git").exists() {
+            if crate::config::is_git_marker(&d.join(".git")) {
                 in_git = true;
                 break;
             }

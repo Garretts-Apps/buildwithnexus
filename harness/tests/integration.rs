@@ -10365,6 +10365,7 @@ fn unreviewed_repo_instructions_are_one_stderr_line_headless() {
     let home = tmp("home");
     let cwd = tmp("proj");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::write(cwd.join("AGENTS.md"), "# Rules\nalways use tabs\n").unwrap();
     let note = "instructions from this repo: AGENTS.md (not reviewed";
     let port = serve_streaming(vec![finish("ok")]);
