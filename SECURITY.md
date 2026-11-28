@@ -496,9 +496,23 @@ Given `--head`, a head recorded elsewhere, it also reports a log cut short
 or rewritten with a consistent chain.
 
 Sandboxed commands can't read or write the log: it is in bwn's own folder.
-A process outside the sandbox, running as you, can rewrite the whole file.
-Anchoring the head outside that reach is the next step: the OS keyring, and
-a commit trailer when bwn commits.
+A process outside the sandbox, running as you, can rewrite the whole file,
+so the chain's head is also kept in two places outside the log:
+- **The OS keyring,** at the end of each turn and session: the macOS
+  keychain, or the Secret Service on Linux. `buildwithnexus audit head`
+  prints it and `buildwithnexus audit path` prints the log's path, so
+  `bwn-audit-verify "$(buildwithnexus audit path)" --head "$(buildwithnexus
+  audit head)"` checks the whole log against it.
+- **A `Bwn-Decision-Log:` trailer** on each commit bwn makes, so pushed
+  history witnesses the head as of that commit.
+
+Sandboxed commands can't reach the macOS keychain (the profile refuses its
+daemon). On Linux the session bus is out of their reach with the checker on
+or the network off; that path is not separately tested. A process outside the
+sandbox running as you can reach the keyring too; against that, a pushed
+commit trailer is the witness. Where no keyring is available (Windows, a
+headless Linux machine without a Secret Service), the posture check says the
+head is only in commit trailers.
 
 ## Permission Gates and the Optional Sandbox
 

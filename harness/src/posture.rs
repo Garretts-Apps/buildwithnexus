@@ -476,6 +476,26 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             )
         });
     }
+    // Where the decision log's head is kept outside the log (roadmap 2.5).
+    v.push(match crate::audit::keyring() {
+        Some(k) => row(
+            "session",
+            "decision log",
+            format!(
+                "~/.buildwithnexus/audit; its head in {} and in a trailer on each commit bwn makes",
+                k.label()
+            ),
+            Level::Good,
+            "anchored",
+        ),
+        None => row(
+            "session",
+            "decision log",
+            "~/.buildwithnexus/audit; no keyring here, so its head is only in a trailer on each commit bwn makes".into(),
+            Level::Warn,
+            "trailers-only",
+        ),
+    });
     let untrusted = crate::config::untrusted_project_files(cwd);
     let project = cwd.join(".buildwithnexus");
     v.push(if !untrusted.is_empty() {

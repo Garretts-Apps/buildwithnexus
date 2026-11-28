@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **The decision log's head is anchored outside the log.** At the end of
+  each turn and session it goes to the OS keyring (the macOS keychain, or
+  the Secret Service on Linux), and each commit bwn makes carries it as a
+  `Bwn-Decision-Log:` trailer. `buildwithnexus audit head` and `audit path`
+  feed `bwn-audit-verify --head`, which then also catches a log rewritten
+  with a consistent chain. The posture check says where the head is kept.
+  Commit messages bwn writes now end with that trailer.
 - **macOS: sandboxed commands can no longer read the keychain.** Seatbelt
   allowed commands to reach the keychain daemon. A keychain item trusts
   the program that created it, so a sandboxed `security

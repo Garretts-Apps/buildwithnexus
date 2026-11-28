@@ -1936,6 +1936,8 @@ pub fn run_build_session_with_images(
     checkpoint::end_turn(cwd);
     turn_done(cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
+    // The decision log's head, outside the log (roadmap 2.5).
+    crate::audit::anchor();
     r
 }
 

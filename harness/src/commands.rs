@@ -682,7 +682,7 @@ pub(crate) fn commit_paths(
         return Ok(None);
     }
     let subject = commit_subject(tool, rels);
-    git_commit_no_hooks(cwd, &hooks, &format!("{subject}\n")).map(Some)
+    git_commit_no_hooks(cwd, &hooks, &with_audit_trailer(&format!("{subject}\n"))).map(Some)
 }
 
 fn git_work_tree(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -774,7 +774,17 @@ fn commit_subject(tool: &str, rels: &[String]) -> String {
     subject.chars().take(72).collect()
 }
 
+// A commit bwn makes carries the decision log's head as a trailer, so pushed
+// history witnesses it (roadmap 2.5).
+fn with_audit_trailer(msg: &str) -> String {
+    match crate::audit::commit_trailer() {
+        Some(t) => format!("{}\n\n{t}\n", msg.trim_end()),
+        None => msg.to_string(),
+    }
+}
+
 pub(super) fn git_commit(cwd: &std::path::Path, msg: &str) -> Result<String, String> {
+    let msg = &with_audit_trailer(msg);
     use std::io::Write;
     let mut child = std::process::Command::new("git")
         .args(["-c", "core.fsmonitor=false", "commit", "-q", "-F", "-"])
