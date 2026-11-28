@@ -137,6 +137,19 @@ pub const PRESETS: &[Preset] = &[
         more_models: &["deepseek-v4-pro"],
         local: false,
     },
+    // Claude on Vertex AI. The endpoint names the project and region; the
+    // credentials are Google's Application Default Credentials (`gcp`),
+    // exchanged for a token only at Google's token endpoint.
+    Preset {
+        id: "vertex",
+        label: "Claude on Vertex AI",
+        protocol: Protocol::Anthropic,
+        base_url: "",
+        env_key: "GOOGLE_APPLICATION_CREDENTIALS",
+        default_model: "claude-sonnet-4-6",
+        more_models: &[],
+        local: false,
+    },
     // Azure OpenAI (Foundry) v1. There is no default endpoint: it is the
     // user's resource, and the key goes only to an Azure host (roadmap 4.4).
     // The model is the deployment's name.
@@ -3689,8 +3702,9 @@ fn write_keys_file(map: &BTreeMap<String, String>) {
     write_atomic(&keys_path(), &body, true);
 }
 
-/// The hosts a cloud preset's credential may go to (roadmap 4.4): a name
-/// under one of these suffixes, with a label of its own in front.
+/// The hosts a cloud preset's credential may go to (roadmap 4.4): one of
+/// these names, or for one that starts with `.` or `-`, a name that ends
+/// in it after a single label of letters, digits and hyphens.
 pub fn cloud_hosts(preset_id: &str) -> &'static [&'static str] {
     match preset_id {
         "azure" => &[
@@ -3698,7 +3712,18 @@ pub fn cloud_hosts(preset_id: &str) -> &'static [&'static str] {
             ".services.ai.azure.com",
             ".cognitiveservices.azure.com",
         ],
+        // The global endpoint, and a region's (`us-east5-aiplatform…`).
+        "vertex" => &["aiplatform.googleapis.com", "-aiplatform.googleapis.com"],
         _ => &[],
+    }
+}
+
+/// What a cloud preset's `base_url` looks like.
+pub fn cloud_endpoint_example(preset_id: &str) -> &'static str {
+    match preset_id {
+        "azure" => "https://NAME.openai.azure.com/openai/v1",
+        "vertex" => "https://REGION-aiplatform.googleapis.com/v1/projects/PROJECT/locations/REGION",
+        _ => "",
     }
 }
 
@@ -3712,8 +3737,8 @@ pub fn cloud_endpoint_ok(preset_id: &str, url: &str) -> Result<(), String> {
     }
     let bad = || {
         format!(
-            "{url} is not a {preset_id} endpoint (https://NAME{} …), so its key isn't sent there",
-            suffixes[0]
+            "{url} is not a {preset_id} endpoint ({}), so its credentials aren't sent there",
+            cloud_endpoint_example(preset_id)
         )
     };
     let u = url::Url::parse(url.trim()).map_err(|_| bad())?;
@@ -3722,8 +3747,15 @@ pub fn cloud_endpoint_ok(preset_id: &str, url: &str) -> Result<(), String> {
         _ => return Err(bad()),
     };
     let under = suffixes.iter().any(|s| {
-        host.strip_suffix(s)
-            .is_some_and(|label| !label.is_empty() && !label.ends_with('.'))
+        if !s.starts_with(['.', '-']) {
+            return host == *s;
+        }
+        host.strip_suffix(s).is_some_and(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
     });
     if u.scheme() != "https"
         || u.port().is_some_and(|p| p != 443)

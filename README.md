@@ -217,6 +217,7 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 | Mistral | remote | `MISTRAL_API_KEY` |
 | DeepSeek | remote | `DEEPSEEK_API_KEY` |
 | Azure OpenAI | your cloud | `AZURE_OPENAI_API_KEY` |
+| Claude on Vertex AI | your cloud | Google credentials |
 | Ollama | local | — |
 | llama.cpp server | local | — |
 | LM Studio | local | — |

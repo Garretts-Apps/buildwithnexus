@@ -160,9 +160,9 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
     if pick.base_url.is_empty() {
         loop {
             let u = ask(&format!(
-                "  your {} endpoint (https://NAME{}/openai/v1): ",
+                "  your {} endpoint ({}): ",
                 pick.label,
-                config::cloud_hosts(pick.id).first().unwrap_or(&"")
+                config::cloud_endpoint_example(pick.id)
             ))?;
             match config::cloud_endpoint_ok(pick.id, &u) {
                 Ok(()) if !u.is_empty() => {
@@ -181,7 +181,8 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
         }
     }
     // A gateway that wants a key says so before the model is chosen.
-    let mut wants_key = !pick.local;
+    // Vertex signs in with Google's credentials file, not a key.
+    let mut wants_key = !pick.local && pick.id != "vertex";
     let detected = if pick.local {
         detect_models(pick, &mut base_url, ollama_found, &mut wants_key)?
     } else {
@@ -706,6 +707,7 @@ fn key_page(provider: &str) -> Option<&'static str> {
         "mistral" => "https://console.mistral.ai/api-keys",
         "deepseek" => "https://platform.deepseek.com/api_keys",
         "azure" => "https://ai.azure.com (your resource's Keys and Endpoint)",
+        "vertex" => "https://cloud.google.com/docs/authentication/provide-credentials-adc",
         _ => return None,
     })
 }

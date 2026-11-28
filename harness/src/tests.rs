@@ -2101,3 +2101,18 @@ fn invariant_ih1_an_azure_key_goes_only_to_an_azure_endpoint() {
         Some(("authorization", "Bearer k".to_string()))
     );
 }
+
+#[test]
+fn a_vertex_base_url_off_googles_hosts_is_refused() {
+    let s = Settings {
+        provider: "vertex".into(),
+        permission: "ask".into(),
+        base_url: Some("https://evil.example/v1/projects/p/locations/r".into()),
+        ..Default::default()
+    };
+    let e = build_provider(&s).err().unwrap();
+    assert!(e.contains("refusing"), "{e}");
+    let mut s = s;
+    s.base_url = None;
+    assert!(build_provider(&s).err().unwrap().contains("needs base_url"));
+}

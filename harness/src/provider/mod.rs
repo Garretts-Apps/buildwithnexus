@@ -49,6 +49,8 @@ pub enum Auth {
     Standard,
     /// Azure OpenAI's `api-key` header, sent only to an Azure endpoint.
     AzureKey,
+    /// A Google access token (`gcp`), sent only to a Vertex AI endpoint.
+    GoogleToken,
 }
 
 /// The header that carries `p`'s key on an OpenAI-shaped request, or None
@@ -60,6 +62,7 @@ pub(crate) fn openai_key_header(p: &Provider, url: &str) -> Option<(&'static str
         Auth::AzureKey => crate::config::cloud_endpoint_ok("azure", url)
             .is_ok()
             .then(|| ("api-key", key.to_string())),
+        Auth::GoogleToken => None,
     }
 }
 
@@ -259,6 +262,7 @@ pub mod bench {
             max_tokens: None,
             effort: Effort::Medium,
             stream: true,
+            vertex: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -279,6 +283,7 @@ pub mod bench {
             max_tokens: None,
             effort: Effort::Off,
             stream: true,
+            vertex: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -992,12 +997,16 @@ fn request_inner(
 ) -> Result<Reply, String> {
     match p.protocol {
         Protocol::Anthropic => {
-            let req = anthropic_request(p)?;
+            let req = match p.auth {
+                Auth::GoogleToken => vertex_request(p, streaming)?,
+                _ => anthropic_request(p)?,
+            };
             let shape = AnthropicBody {
                 model: &p.model,
                 max_tokens: p.max_tokens,
                 effort: p.effort,
                 stream: streaming,
+                vertex: p.auth == Auth::GoogleToken,
             };
             let body = anthropic_bytes(msgs, tools, &shape);
             finish(

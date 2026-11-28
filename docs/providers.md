@@ -37,6 +37,38 @@ and any `AWS_*` variable, is removed from their environment.
   with no user name or password in the URL. Any other host gets no key.
 - **API version:** the v1 API doesn't need an `api-version` parameter.
 
+### Claude on Vertex AI
+
+```json
+{
+  "provider": "vertex",
+  "base_url": "https://us-east5-aiplatform.googleapis.com/v1/projects/PROJECT/locations/us-east5",
+  "model": "claude-sonnet-4-6"
+}
+```
+
+- **Credentials:** Google's Application Default Credentials. bwn uses the
+  file named by `GOOGLE_APPLICATION_CREDENTIALS`, or else the file that
+  `gcloud auth application-default login` writes. The metadata server
+  isn't used.
+- **Service-account key:** bwn signs an RS256 assertion with the key and
+  exchanges it for an access token.
+- **User credential:** bwn exchanges its refresh token for an access
+  token.
+- **Token endpoint:** the exchange always goes to
+  `https://oauth2.googleapis.com/token`. A `token_uri` in the file is
+  ignored, so a planted file can't send a credential anywhere else.
+- **Token storage:** the token is kept in memory only and renewed before
+  it expires.
+- **Endpoint:** `base_url` names your project and region, under
+  `aiplatform.googleapis.com` or `REGION-aiplatform.googleapis.com`. A
+  token goes to no other host. bwn checks the host before it reads any
+  credential.
+- **Requests:** bwn sends `streamRawPredict` (or `rawPredict`) for the
+  model, with `anthropic_version: vertex-2023-10-16` in the body.
+- **Hidden from commands:** the key file and gcloud's folder are hidden
+  from the commands the agent runs, and so is the variable.
+
 ### Subscription sign-in
 
 bwn doesn't offer sign-in with a Claude subscription. Anthropic's terms
@@ -53,3 +85,8 @@ The checks ran against tests, not live cloud accounts:
 
 - The key binding: each host that should be refused is refused.
 - The header that each endpoint receives.
+- The Vertex request body.
+- An assertion signed with a key generated for each test run, checked
+  against that key's public half.
+- A token exchange against a mock endpoint, with a planted `token_uri`
+  that receives nothing.
