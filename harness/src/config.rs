@@ -498,6 +498,10 @@ pub struct Settings {
     /// rate-limited or overloaded past its retries (roadmap 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<String>,
+    /// Language servers whose diagnostics follow an edit (roadmap 4.6):
+    /// name → {"command", "args", "extensions", "wait_ms"}.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lsp: BTreeMap<String, serde_json::Value>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -638,6 +642,7 @@ impl Default for Settings {
             security_gates: Vec::new(),
             compaction: None,
             fallback_model: None,
+            lsp: BTreeMap::new(),
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),

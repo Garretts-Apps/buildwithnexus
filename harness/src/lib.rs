@@ -60,6 +60,7 @@ pub mod knowledge;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub mod local;
+pub mod lsp;
 pub mod mcp;
 pub mod mcp_auth;
 pub mod media;

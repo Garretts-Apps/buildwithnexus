@@ -7,6 +7,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Language-server diagnostics after an edit.** `"lsp": {"rust":
+  {"command": "rust-analyzer", "extensions": ["rs"]}}` starts the server
+  (inside the sandbox) the first time a file it serves is edited, and adds
+  its errors and warnings for that file to the edit's result. A project
+  file's `lsp` waits for trust.
 - **Plugins.** `"plugins": {"kit": true}` loads `~/.buildwithnexus/plugins/kit`
   as one unit: its `commands/`, `skills/` and `agents/` folders, and the
   `hooks` and `mcp_servers` in its `plugin.json`. `{"path": "~/my-kit"}`

@@ -336,6 +336,16 @@ const KEYS: &[Key] = &[
         user: &[r#""small-model""#, "5"],
         project: &[r#""expensive-model""#, "5"],
     },
+    // Names a program to run, like an MCP server.
+    Key {
+        name: "lsp",
+        class: Class::Trust,
+        user: &[
+            r#"{"rust":{"command":"rust-analyzer","extensions":["rs"]}}"#,
+            "5",
+        ],
+        project: &[r#"{"x":{"command":"./evil","extensions":["rs"]}}"#, "5"],
+    },
     Key {
         name: "sandbox_expose",
         class: Class::Trust,
