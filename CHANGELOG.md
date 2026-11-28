@@ -6,6 +6,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking changes
+- **Headless auto runs ask more after reading the project's files (roadmap
+  5.1).** In `--json` runs and the GitHub Action, an ask is a denial. Once
+  the session has read a project file or command output, three things now
+  end the run with exit 3 (`approval_blocked`):
+  - a fetch or web search to a host the task didn't name;
+  - an MCP call that can change things;
+  - an edit of a CI, hook or policy file.
+
+  To let one through, name the host in the task or add an allow rule for
+  the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
+
 ### Security
 - **Every tool result names its source, and auto mode acts on it (roadmap
   5.1).** Each result is labelled with where its text came from, and the

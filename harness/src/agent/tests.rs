@@ -4363,11 +4363,13 @@ fn the_compaction_setting_moves_the_threshold_and_the_kept_tail() {
 }
 
 // Roadmap 5.1 (SO-8): a seeded set of planted instructions (a web page, an
-// MCP result, a dependency's README, a code comment) leads to no unasked
-// fetch, MCP write or edit of a CI, hook or policy file in auto mode, and
-// from someone else's text to no unasked command either. The project's
-// own text leaves sandboxed commands running (the tiered design the owner
-// chose). The reads go through `tools::run`, which labels their source.
+// MCP result, a dependency's README read by a file tool and by a command,
+// a code comment) leads to no unasked fetch, MCP write or edit of a CI,
+// hook or policy file in auto mode, and from someone else's text to no
+// unasked command either. The project's own text leaves commands as they
+// were (the tiered design the owner chose). Whether a command asks before
+// anything is read depends on the backend this cell runs (Landlock alone
+// asks before each), so commands are held to that baseline.
 #[test]
 fn invariant_so8_planted_instructions_lead_to_no_unasked_action() {
     let _g = crate::config::TEST_ENV_LOCK
@@ -4397,16 +4399,18 @@ fn invariant_so8_planted_instructions_lead_to_no_unasked_action() {
     let hook_by_command = json!({"command": "cp x .husky/pre-commit"});
     let plain_edit = json!({"path": "src/lib.rs", "content": "x"});
     let asks = |name: &str, input: &serde_json::Value| gate(Permission::Auto, name, input, &cwd);
+    let tier_reason = |why: &Option<String>| {
+        why.as_deref()
+            .is_some_and(|w| w.contains("someone else wrote") || w.contains("planted instruction"))
+    };
 
-    // Nothing read yet: auto mode runs all of it.
+    // Nothing read yet.
     clear_untrusted_read();
-    for (n, i) in [
-        ("run_command", &cmd),
-        ("fetch_url", &fetch),
-        ("write_file", &ci_edit),
-    ] {
+    for (n, i) in [("fetch_url", &fetch), ("write_file", &ci_edit)] {
         assert!(asks(n, i).is_none(), "{n} asked before anything was read");
     }
+    let baseline = asks("run_command", &cmd);
+    assert!(!tier_reason(&baseline), "{baseline:?}");
 
     // Each seeded source of someone else's text, then each action.
     let dependency_readme = || {
@@ -4423,10 +4427,24 @@ fn invariant_so8_planted_instructions_lead_to_no_unasked_action() {
             .content
             .starts_with("[untrusted content from read_file (a dependency's file):"));
     };
-    let external_sources: [(&str, &dyn Fn()); 3] = [
+    // The source a command over a dependency's files gets; running it
+    // depends on the cell, so the label is taken from `tools::run`'s rule.
+    let dependency_by_command = || {
+        let read = json!({"command": "cat node_modules/dep/README.md"});
+        let out = crate::tools::run("run_command", &read, &cwd);
+        match &out.source {
+            Some(crate::provider::Source::External(v)) => assert!(v.contains("dependency"), "{v}"),
+            other => panic!("a command over a dependency's files was labelled {other:?}"),
+        }
+    };
+    let external_sources: [(&str, &dyn Fn()); 4] = [
         ("a web page", &|| mark_untrusted_read("fetch_url")),
         ("an MCP result", &|| mark_untrusted_read("mcp__srv__get")),
         ("a dependency's README", &dependency_readme),
+        (
+            "a dependency's README read by a command",
+            &dependency_by_command,
+        ),
     ];
     for (what, read) in external_sources {
         clear_untrusted_read();
@@ -4439,7 +4457,8 @@ fn invariant_so8_planted_instructions_lead_to_no_unasked_action() {
             ("run_command", &ci_by_command),
             ("run_command", &hook_by_command),
         ] {
-            assert!(asks(n, i).is_some(), "after {what}, {n} {i} ran unasked");
+            let why = asks(n, i);
+            assert!(tier_reason(&why), "after {what}, {n} {i}: {why:?}");
         }
         assert!(
             asks("write_file", &plain_edit).is_none(),
@@ -4465,12 +4484,17 @@ fn invariant_so8_planted_instructions_lead_to_no_unasked_action() {
         ("run_command", &ci_by_command),
         ("run_command", &hook_by_command),
     ] {
-        let why = asks(n, i).unwrap_or_else(|| panic!("after a code comment, {n} {i} ran unasked"));
-        assert!(why.contains("planted instruction"), "{why}");
+        let why = asks(n, i);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("planted instruction")),
+            "after a code comment, {n} {i}: {why:?}"
+        );
     }
-    assert!(
-        asks("run_command", &cmd).is_none(),
-        "the workspace tier keeps sandboxed commands running"
+    assert_eq!(
+        asks("run_command", &cmd),
+        baseline,
+        "the workspace tier leaves commands as they were"
     );
     assert!(asks("write_file", &plain_edit).is_none());
 

@@ -743,7 +743,8 @@ file and through compaction, so a resumed session knows what it read:
 - **Someone else's text:** web pages, search results, MCP servers' output,
   files in a dependency folder (`node_modules`, `vendor`, `site-packages`,
   `.venv`, `go/pkg/mod`, …) or outside the workspace, and the output of a
-  command that reached the network through the checker. It is labelled as
+  command that reached the network through the checker or that names a
+  dependency folder. It is labelled as
   untrusted for the model. After a session reads any, auto mode asks
   before commands, fetches and MCP calls that can change things.
 - **The project's own text:** its files, and the output of commands that
@@ -757,9 +758,12 @@ file and through compaction, so a resumed session knows what it read:
   `azure-pipelines.yml`, `Jenkinsfile`, `.buildkite`, `.husky`,
   `.pre-commit-config.yaml`, `lefthook.yml`, `.envrc`, `.git` and
   `.buildwithnexus`. The sandbox (bubblewrap, the namespace backend and
-  Seatbelt) makes those that exist read-only to commands. A new one made
-  by a command that doesn't name it is caught only when the turn's
-  changes are checked.
+  Seatbelt) makes those that exist read-only to commands. One changed
+  some other way is caught when the turn ends: for example, a file made
+  where none was, under a name a command built at run time, or a change
+  by brokered git. The run ends `approval_blocked` and names the file,
+  and the change isn't committed. `.git` and `.buildwithnexus` are
+  read-only to commands on every backend.
 
 ### What the automatic checks do not guarantee
 

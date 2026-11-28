@@ -5758,16 +5758,21 @@ pub fn is_protected_path(p: &Path, cwd: &Path) -> bool {
 /// `cp x .husky/pre-commit`). The sandbox also keeps the existing ones
 /// read-only; this catches a new file it can't.
 pub fn command_names_protected_path(cmd: &str, cwd: &Path) -> bool {
+    command_tokens(cmd).any(|t| {
+        let t = t.strip_prefix("./").unwrap_or(t);
+        let first = t.split('/').next().unwrap_or(t);
+        PROTECTED_PATHS.contains(&first) || is_protected_path(&resolve(cwd, t), cwd)
+    })
+}
+
+// A command's words, split where a path argument would end: at spaces,
+// quotes, separators and redirections.
+fn command_tokens(cmd: &str) -> impl Iterator<Item = &str> {
     cmd.split(|c: char| {
         c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '|' | '&' | '(' | ')' | '`')
     })
     .map(|t| t.trim_start_matches(['>', '<', '=']))
     .filter(|t| !t.is_empty())
-    .any(|t| {
-        let t = t.strip_prefix("./").unwrap_or(t);
-        let first = t.split('/').next().unwrap_or(t);
-        PROTECTED_PATHS.contains(&first) || is_protected_path(&resolve(cwd, t), cwd)
-    })
 }
 
 /// Folders that hold other people's code: packages, vendored copies,
@@ -5861,9 +5866,16 @@ fn source_of(
             }
         }
         table::Tool::RunCommand | table::Tool::PythonScript | table::Tool::ReadServerLog => {
+            let reads_dependency = input["command"]
+                .as_str()
+                .is_some_and(|c| command_tokens(c).any(|t| is_dependency_path(Path::new(t))));
             if crate::egress::reached() > reached_before {
                 Some(Source::External(format!(
                     "{name} (a command that reached the network)"
+                )))
+            } else if reads_dependency {
+                Some(Source::External(format!(
+                    "{name} (a command over a dependency's files)"
                 )))
             } else {
                 Some(Source::Workspace(name.to_string()))
@@ -7283,6 +7295,11 @@ mod source_tests {
             Some(Source::Workspace("run_command".into()))
         );
         crate::egress::note_reached_for_test();
+        // A command over a dependency's files.
+        assert!(matches!(
+            source_of("run_command", &json!({"command": "cat node_modules/x/README.md"}), &cwd, &done("t"), crate::egress::reached()),
+            Some(Source::External(v)) if v.contains("dependency")
+        ));
         assert!(matches!(
             source_of("run_command", &cmd, &cwd, &done("fetched"), before),
             Some(Source::External(v)) if v.contains("reached the network")

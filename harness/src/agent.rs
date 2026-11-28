@@ -2418,6 +2418,11 @@ fn on_text_reply(
 /// What one BUILD turn tracks across its steps.
 #[derive(Default)]
 struct TurnState {
+    /// A command this turn named a CI, hook or policy path, and so went
+    /// through the gate that asks about them (roadmap 5.1).
+    named_protected: bool,
+    /// The turn changed a CI, hook or policy file that nothing asked about.
+    protected_unasked: bool,
     /// Files read this turn, for read-before-write.
     read_paths: std::collections::HashSet<PathBuf>,
     loop_guard: ToolLoopGuard,
@@ -3063,6 +3068,43 @@ fn build_turn(
                 _ => false,
             };
             if let (Some(base), Some(now)) = (&st.tree_base, &now) {
+                // Roadmap 5.1: in an auto session that read text, a CI, hook
+                // or policy file the turn changed with no file tool and no
+                // command naming it (a name built at run time, a file
+                // created where none was, brokered git) was never asked
+                // about. The run says so, and the change isn't committed.
+                let tainted = untrusted_read().or_else(local_read);
+                if let (Permission::Auto, Some(tool), false) = (perm, &tainted, st.named_protected)
+                {
+                    let by_tools = st.changed_files.clone();
+                    for p in crate::tree::changed_paths(base, now, cwd) {
+                        let shown = p.display().to_string();
+                        // `.git` and `.buildwithnexus` are read-only to
+                        // commands on every backend (and on Landlock alone
+                        // each command asks); bwn writes its own state in
+                        // the second.
+                        let first = p
+                            .strip_prefix(cwd)
+                            .ok()
+                            .and_then(|r| r.components().next())
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+                        let own = matches!(first.as_deref(), Some(".git" | ".buildwithnexus"));
+                        if !own && tools::is_protected_path(&p, cwd) && !by_tools.contains(&shown) {
+                            st.protected_unasked = true;
+                            let rel = p.strip_prefix(cwd).unwrap_or(&p).display().to_string();
+                            let why = format!(
+                                "{rel} changed without being asked about: it is a CI, hook or policy file, and this session read text through {tool} that could carry a planted instruction"
+                            );
+                            report::notice(&format!("  ⚠ {why}"));
+                            report::note_denial(
+                                "run_command",
+                                &format!("change {rel}"),
+                                &why,
+                                true,
+                            );
+                        }
+                    }
+                }
                 for p in crate::tree::changed_paths(base, now, cwd) {
                     let path = p.display().to_string();
                     if !st.changed_files.contains(&path) {
@@ -3256,6 +3298,9 @@ fn build_turn(
                 if st.check_work_passed == Some(false) {
                     hold_commit_notice();
                     stopped_short(Outcome::CheckWorkFailed);
+                } else if st.protected_unasked {
+                    hold_commit_notice();
+                    stopped_short(Outcome::ApprovalBlocked);
                 } else {
                     crate::evidence::note(crate::evidence::Facts {
                         checks_passed: st.check_work_passed,
@@ -3522,6 +3567,11 @@ fn record_outcome(
     input: &serde_json::Value,
     out: tools::Outcome,
 ) -> ToolResult {
+    if let Some(c) = input["command"].as_str() {
+        if tools::command_names_protected_path(c, ctx.cwd) {
+            st.named_protected = true;
+        }
+    }
     let mut out = vision_checked(ctx.p, out);
     post_tool_hooks(name, input, &mut out, ctx.cwd);
     if out.is_error {
