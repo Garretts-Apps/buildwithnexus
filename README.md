@@ -789,26 +789,8 @@ are refused. `"vision": false` keeps pictures out. `notify` is `"auto"`,
 
 ## Checks
 
-When a turn changes the working tree, bwn runs the project's checks before
-the run can end as `success`. Any change counts, whether a file edit, a
-command, or a helper's work. Failing checks go back to the model, at most
-twice a turn, and a run whose checks still fail exits 7. A `check_work` call
-with the model's own `command` is advisory: it never stands in for them.
-
-bwn detects the checks from `Cargo.toml`, `package.json` (its `typecheck`,
-`build`, `test` and `lint` scripts), `go.mod` or Python project files. To
-name them yourself, set `checks`:
-
-```json
-{ "checks": ["npm test", { "name": "types", "command": "npx tsc --noEmit", "kind": "build" }] }
-```
-
-`kind` (`build`, `test` or `lint`, default `test`) is what `check_work`'s
-`only` filters on. `"checks": []` means no checks, and a named check that
-can't run fails. The checks are the ones the turn started with: a turn that
-rewrites the `package.json` script they run fails them. A project's `checks` run
-code, so like its hooks they wait until you trust the file; until then bwn
-runs the checks it detects.
+A turn that changes files must pass the project's checks, detected or named
+with `checks`, or the run exits 7: [Checks](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/checks.md).
 
 ## Hooks
 
@@ -1075,9 +1057,6 @@ certificate; a TLS-inspecting proxy needs its root in `NODE_EXTRA_CA_CERTS`.
   (`*_API_KEY`, `*_API_TOKEN`, `*_TOKEN`, `*_SECRET`, `*_SECRETS`,
   `*_PASSWORD`, `AWS_*`, `HF_TOKEN`); `shell_env_passthrough` opts a variable
   back in. See [Permissions](#permissions).
-- `repo_map` lists source files and top-level symbols (ranked by an optional
-  `focus`). It is on by default and is not pasted into the prompt.
-  `"repo_map": false` or `--no-repo-map` hides it.
 - The file tools (`grep_files`, `find_files`, `find_paths`, `list_tree`) and
   `@` completion skip what `.gitignore` ignores and Python virtualenvs, and
   never list `.env` and other sensitive files, even when a `.gitignore` line
