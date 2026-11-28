@@ -9200,7 +9200,16 @@ struct Acp {
 
 impl Acp {
     fn start(home: &Path, cwd: &Path, args: &[&str]) -> Acp {
+        Acp::start_with(home, cwd, args, false)
+    }
+
+    // `ask_posture`: without the test-wide BWN_ACCEPT_POSTURE, so the
+    // startup check is asked in the editor.
+    fn start_with(home: &Path, cwd: &Path, args: &[&str], ask_posture: bool) -> Acp {
         let mut cmd = Command::new(BIN);
+        if ask_posture {
+            cmd.env_remove("BWN_ACCEPT_POSTURE");
+        }
         for var in NET_VARS {
             cmd.env_remove(var);
         }
@@ -12886,4 +12895,30 @@ fn acp_the_question_tool_is_answered_in_the_editor() {
     let second = posts.lock().unwrap()[1].clone();
     assert!(second.contains("The user answered: B.txt"), "{second}");
     let _ = acp.close();
+}
+
+// Roadmap 4.2: under ACP the startup check is asked in the editor before
+// the first model request; accepted, the turn runs; refused, it doesn't
+// reach the model.
+#[test]
+fn acp_the_startup_check_is_answered_in_the_editor() {
+    for (answer, runs) in [("allow_once", true), ("reject_once", false)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let (port, posts) = serve_sse(vec![text("hello")]);
+        write_config(&home, "llamacpp", "ask", port);
+        let mut acp = Acp::start_with(&home, &cwd, &[], true);
+        acp_init(&mut acp, json!({}));
+        let sid = acp_new_session(&mut acp, &cwd);
+        let done = acp.call("session/prompt", prompt(&sid, "hi"), &mut choose(answer));
+        let asked = acp.agent_requests("session/request_permission");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.to_string().contains("accept this posture")),
+            "{answer}: {asked:?}; {done}"
+        );
+        assert_eq!(!posts.lock().unwrap().is_empty(), runs, "{answer}: {done}");
+        let _ = acp.close();
+    }
 }
