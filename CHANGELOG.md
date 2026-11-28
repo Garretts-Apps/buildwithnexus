@@ -13,6 +13,49 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   startup-check stores the first sealed then read as rewritten, so saved
   trust was lost. It is now written whole and linked into place, and a
   key file that doesn't read is never replaced.
+- **Secret and dependency gates (roadmap 3.5).** `"security_gates":
+  ["secrets", "dependencies"]` makes every change pass gitleaks, and every
+  change to a manifest or lockfile pass osv-scanner, before the run can end
+  as `success` or be committed. A listed scanner that isn't installed
+  blocks.
+- **An evidence record for each commit bwn makes (roadmap 3.7; C4).** The
+  commit names it in a `Bwn-Evidence:` trailer: the files as committed, the
+  checks and their verdict, the verifier's status and the decision log's
+  head. `buildwithnexus evidence verify <commit>` checks the record is
+  unchanged and matches the commit.
+- **Checks can be read from a scanner's report (roadmap 3.4).** A `checks`
+  entry with `"format": "sarif"` (SARIF 2.1.0) or `"json"` passes only when
+  its report parses and holds no finding at or above `fail_on` (`error` by
+  default); a scanner that crashed or printed something else fails. The
+  report comes from the command's output or from an `output` file. The
+  entries come only from settings the model can't change, so it can't add,
+  drop or reorder them.
+- **No commit for a failing change (roadmap 3.8; V3).** With `auto_commit`
+  on, file-tool edits were committed one by one as they were made, before
+  any check. Now a turn's edits are committed once, at its end, when its
+  checks pass and the verifier doesn't block; when they fail, the files stay
+  uncommitted and the run says how many.
+- **`git add` and `git commit` work from sandboxed commands (roadmap 3.3;
+  A4).** `git` in a command is now bwn's, which runs the real git outside
+  the sandbox for the repositories found at the start, with listed
+  subcommands and options, no hooks, fsmonitor, pager or editor, and every
+  answer in the decision log; `.git` stays read-only to the command, so
+  nothing it plants runs. Your own hooks don't run for these commits.
+  `git fetch` and `git pull` go the same way, to a configured HTTPS or SSH
+  remote whose host the network rules allow, with your SSH agent and
+  credential helpers used outside the sandbox and never seen inside it.
+  `push` isn't brokered; on Landlock alone, nothing is.
+- **Verification facts come from checks, not tool names (roadmap 3.2;
+  V4).** A web search or fetch no longer meets the license, vulnerability,
+  maintenance or size reviews of a new dependency; until bwn runs scanners
+  for them (3.4, 3.5), only a person's `BWN_CHECKS_DONE` does. Caller search
+  takes a code search (`grep`, `glob`, `find_files`…), not `web_search`. A
+  shell command no longer counts as tests run; the project's checks do. The
+  security review is met by a passing check of kind `security` in the
+  `checks` setting, on the final tree, and the trust screen marks a
+  project's. New dependencies are now read from `package.json`,
+  `Cargo.toml`, `requirements.txt` and `go.mod`, so the dependency review
+  fires from a real run.
 - **The `checks` setting names the checks that must pass (roadmap 3.1).**
   It replaces detection; `[]` means none. A project file's `checks` run
   code, so they wait for trust like its hooks, and the trust screen lists

@@ -73,6 +73,16 @@ pub const CAPABILITIES: &[Cap] = &[
         tests: &[(BW | SB, "nested_repositories_stay_read_only_too"), (UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only"), (BW | UN | SB, "invariant_nested_git_past_the_bounds_is_disclosed")],
     },
     Cap {
+        id: "git_through_bwn",
+        guarantee: "`git add` and `commit` from a command, with hooks and config unchanged",
+        bwrap: "Yes: `git` in a command is bwn's, which runs the real one outside with listed subcommands and options, no hooks, in the repositories found at the start. Fetch and pull from a configured HTTPS or SSH remote whose host the network rules allow, with your credentials kept outside. No push",
+        userns: "Same as bubblewrap",
+        landlock: "No: `.git` isn't read-only there, so git isn't run for commands",
+        seatbelt: "Same as bubblewrap",
+        proven_by: "`invariant_au5_planted_git_hooks_and_config_never_run`, `invariant_au5_only_listed_git_subcommands_and_options_pass`, `invariant_au5_a_repository_made_later_or_above_is_not_served`, `invariant_au5_the_brokered_git_runs_no_pager_diff_program_or_hook`, `invariant_au5_fetch_reaches_only_allowed_remote_hosts`",
+        tests: &[(BW | UN | SB, "invariant_au5_planted_git_hooks_and_config_never_run"), (BW | UN | SB, "invariant_au5_only_listed_git_subcommands_and_options_pass"), (BW | UN | SB, "invariant_au5_a_repository_made_later_or_above_is_not_served"), (BW | UN | SB, "invariant_au5_the_brokered_git_runs_no_pager_diff_program_or_hook"), (BW | UN | SB, "invariant_au5_fetch_reaches_only_allowed_remote_hosts")],
+    },
+    Cap {
         id: "credential_stores_hidden",
         guarantee: "Credential stores unreadable",
         bwrap: "Folders yes, contents and names. A hidden file is covered by an empty file, so its contents are hidden but whether it exists still shows",

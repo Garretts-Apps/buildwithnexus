@@ -360,10 +360,14 @@ impl RuleEngine {
                 "failing_test_before_fix" | "passing_test_after_fix" | "tests_for_new_files" => {
                     !ctx.tests_added.is_empty() || ctx.tests_run
                 }
-                "caller_search" => ctx
-                    .tools_called
-                    .iter()
-                    .any(|t| t.contains("grep") || t.contains("search") || t.contains("find")),
+                // A code search, by bwn's own search tools; a web search
+                // finds no callers (roadmap 3.2; analysis V4).
+                "caller_search" => ctx.tools_called.iter().any(|t| {
+                    matches!(
+                        t.as_str(),
+                        "grep" | "grep_files" | "glob" | "find_files" | "find_paths"
+                    )
+                }),
                 "changelog_entry" => {
                     ctx.has_changelog_entry
                         || ctx.changed_files.iter().any(|f| {
@@ -375,13 +379,13 @@ impl RuleEngine {
                 "security_review" | "secret_scan" => {
                     ctx.security_review_done || fact_true(&ctx.custom_facts, req)
                 }
+                // No in-session check establishes these yet (3.4 and 3.5
+                // add scanners): a web search or fetch is not one. Only a
+                // person recording them as done meets them.
                 "license_check"
                 | "vulnerability_check"
                 | "maintenance_check"
-                | "size_impact_review" => ctx
-                    .tools_called
-                    .iter()
-                    .any(|t| t.contains("search") || t.contains("web") || t.contains("fetch")),
+                | "size_impact_review" => fact_true(&ctx.custom_facts, req),
                 _ => {
                     // Check if custom fact claims it's satisfied
                     ctx.custom_facts
@@ -678,6 +682,66 @@ mod tests {
             .evaluate(&done)
             .iter()
             .any(|v| v.rule_id == "auth_change_requires_security_review"));
+    }
+
+    // VE-4 (roadmap 3.2; analysis V4): a tool's name meets no requirement
+    // it doesn't perform. A web search or fetch doesn't review a dependency
+    // or a security change, and doesn't search the code for callers.
+    #[test]
+    fn invariant_ve4_tool_names_do_not_meet_requirements() {
+        let engine = RuleEngine::load_defaults();
+        let web = vec![
+            "web_search".to_string(),
+            "fetch_url".to_string(),
+            "kb_query".into(),
+        ];
+        let ctx = EvaluationContext {
+            changed_files: vec!["src/auth/login.py".into()],
+            dependencies_added: vec!["left-pad".into()],
+            tools_called: web.clone(),
+            ..Default::default()
+        };
+        let ids: Vec<String> = engine
+            .evaluate(&ctx)
+            .into_iter()
+            .map(|v| v.rule_id)
+            .collect();
+        assert!(
+            ids.contains(&"new_dependency_review".to_string()),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(&"auth_change_requires_security_review".to_string()),
+            "{ids:?}"
+        );
+        // Caller search: a web search isn't one; a code search is.
+        let api = |tools: Vec<String>| EvaluationContext {
+            changed_files: vec!["api/public_api.rs".into()],
+            tools_called: tools,
+            ..Default::default()
+        };
+        let fires = |c: &EvaluationContext| {
+            engine
+                .evaluate(c)
+                .iter()
+                .any(|v| v.message.contains("caller_search"))
+        };
+        if fires(&api(vec![])) {
+            assert!(fires(&api(web)));
+            assert!(!fires(&api(vec!["grep".into()])));
+        }
+        // A person's record still meets them.
+        let done = EvaluationContext {
+            custom_facts: checks_done_facts(Some(
+                "license_check,vulnerability_check,maintenance_check,size_impact_review,security_review",
+            )),
+            ..ctx
+        };
+        assert!(
+            engine.evaluate(&done).is_empty(),
+            "{:?}",
+            engine.evaluate(&done)
+        );
     }
 
     #[test]

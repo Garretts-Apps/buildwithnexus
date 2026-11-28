@@ -394,6 +394,24 @@ impl Outcome {
 // yet). A turn that returns Ok with this set is not a success.
 static STOPPED_SHORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// Edits held for a commit that the turn's failing checks or verification
+// keep back: said once, the files stay as they are on disk.
+fn hold_commit_notice() {
+    let n = crate::commands::held_count();
+    if n > 0 {
+        report::notice(&format!(
+            "  {n} changed file{} not committed: the change didn't pass (it's committed once it does)",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+}
+
+/// Whether a review is running: it makes no changes (git through the
+/// sandbox reads this, roadmap 3.3).
+pub fn reviewing() -> bool {
+    REVIEWING.load(Ordering::Relaxed)
+}
+
 fn stopped_short(o: Outcome) {
     let idx = Outcome::ALL.iter().position(|x| *x == o).unwrap_or(0);
     let _ = STOPPED_SHORT.compare_exchange(
@@ -2307,6 +2325,12 @@ struct TurnState {
     /// The checks this turn's changes must pass, as they were when it
     /// began: the turn can't rewrite them into passing.
     check_plan: Option<tools::CheckPlan>,
+    /// The manifests' dependencies when the turn began, and whether the
+    /// last mandatory pass included a `security` check a person named.
+    deps_base: Option<std::collections::BTreeSet<String>>,
+    security_checked: bool,
+    /// The last report of the project's checks, for the evidence record.
+    check_report: String,
     // The project's checks were refused for want of a terminal: asking
     // again at finish would only be refused again.
     checks_unapprovable: bool,
@@ -2405,6 +2429,7 @@ fn build_turn(
     if depth == 0 {
         st.tree_base = Some(crate::tree::take(cwd));
         st.check_plan = Some(tools::check_plan(cwd));
+        st.deps_base = Some(crate::tree::manifest_dependencies(cwd));
     }
     // From here the loop only appends to the transcript, except where it
     // compacts, which resets the count.
@@ -2948,7 +2973,15 @@ fn build_turn(
                         None
                     }
                     None => Some(match &st.check_plan {
-                        Some(plan) => tools::run_check_plan(plan, cwd),
+                        Some(plan) => tools::run_check_plan(
+                            plan,
+                            cwd,
+                            st.changed_files.iter().any(|f| {
+                                std::path::Path::new(f)
+                                    .file_name()
+                                    .is_some_and(|n| tools::MANIFESTS.iter().any(|m| n == *m))
+                            }),
+                        ),
                         None => tools::run("check_work", &input, cwd),
                     }),
                 };
@@ -2973,6 +3006,12 @@ fn build_turn(
                 });
                 if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
                     st.check_work_passed = Some(!out.is_error);
+                    st.check_report = out.content.clone();
+                    st.security_checked = !out.is_error
+                        && st
+                            .check_plan
+                            .as_ref()
+                            .is_some_and(|p| p.has_security_check());
                     if !out.is_error {
                         // The tree as the checks left it.
                         st.mandatory_pass = Some(crate::tree::take(cwd));
@@ -3004,6 +3043,29 @@ fn build_turn(
                     changed_files: st.changed_files.clone(),
                     tool_calls: st.tool_records.clone(),
                     tests_passed: st.check_work_passed,
+                    // Only on the tree the security check passed on.
+                    security_checks_passed: st.security_checked
+                        && st
+                            .mandatory_pass
+                            .as_ref()
+                            .is_some_and(|p| p.same_as(&crate::tree::take(cwd))),
+                    dependencies_changed: st
+                        .deps_base
+                        .as_ref()
+                        .map(|base| {
+                            let now = crate::tree::manifest_dependencies(cwd);
+                            let name = |d: &String| {
+                                d.split_once(':').map_or(d.clone(), |(_, n)| n.to_string())
+                            };
+                            now.difference(base)
+                                .map(|d| (name(d), "added".to_string()))
+                                .chain(
+                                    base.difference(&now)
+                                        .map(|d| (name(d), "removed".to_string())),
+                                )
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     ..Default::default()
                 };
                 let rep = verifier.verify(&ctx);
@@ -3042,6 +3104,7 @@ fn build_turn(
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
                         report::notice(&format!("  ⚠ verification {}", rep.status.label()));
+                        hold_commit_notice();
                         if st.check_work_passed == Some(false) {
                             stopped_short(Outcome::CheckWorkFailed);
                         }
@@ -3063,9 +3126,22 @@ fn build_turn(
                     crate::verifier::VerificationStatus::Passed => {}
                 }
                 // The last check_work verdict stands: finishing over failing
-                // checks is not a success.
+                // checks is not a success, and the change isn't committed
+                // (roadmap 3.8).
                 if st.check_work_passed == Some(false) {
+                    hold_commit_notice();
                     stopped_short(Outcome::CheckWorkFailed);
+                } else {
+                    crate::evidence::note(crate::evidence::Facts {
+                        checks_passed: st.check_work_passed,
+                        checks_report: st.check_report.clone(),
+                        verifier: rep.status.to_string(),
+                    });
+                    for r in crate::commands::commit_held() {
+                        if let Err(e) = r {
+                            report::notice(&format!("auto-commit skipped: {e}"));
+                        }
+                    }
                 }
             }
             return Ok(s);
@@ -3347,9 +3423,15 @@ fn record_outcome(
         let as_pinned = st
             .check_plan
             .as_ref()
-            .is_none_or(|p| *p == tools::check_plan(ctx.cwd));
+            .is_none_or(|p| *p == tools::check_plan(ctx.cwd) && !p.has_gates());
         if !advisory && as_pinned && !check_work_found_no_project(&out.content) {
             st.check_work_passed = Some(!out.is_error);
+            st.check_report = out.content.clone();
+            st.security_checked = !out.is_error
+                && st
+                    .check_plan
+                    .as_ref()
+                    .is_some_and(|p| p.has_security_check());
             st.mandatory_pass = (!out.is_error).then(|| crate::tree::take(ctx.cwd));
         }
     }

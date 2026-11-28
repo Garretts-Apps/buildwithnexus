@@ -315,6 +315,14 @@ const KEYS: &[Key] = &[
         ],
         project: &["[]", r#"["true"]"#, r#"[{"command":"./evil.sh"}]"#, "5"],
     },
+    // A project's gates would only tighten, but they run scanners; they
+    // wait for trust like the checks they join.
+    Key {
+        name: "security_gates",
+        class: Class::Trust,
+        user: &[r#"["secrets"]"#, "[]", "5"],
+        project: &[r#"["secrets","dependencies"]"#, "[]", "5"],
+    },
     Key {
         name: "sandbox_expose",
         class: Class::Trust,

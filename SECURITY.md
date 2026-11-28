@@ -506,6 +506,16 @@ so the chain's head is also kept in two places outside the log:
 - **A `Bwn-Decision-Log:` trailer** on each commit bwn makes, so pushed
   history witnesses the head as of that commit.
 
+Each commit bwn makes for a turn's change also names an evidence record in
+a `Bwn-Evidence:` trailer (roadmap 3.7): the files as committed, the
+project's checks and their verdict, the verifier's status and the log's
+head, kept in `~/.buildwithnexus/evidence/` under the record's SHA-256.
+`buildwithnexus evidence verify <commit>` exits 0 when the record is there,
+unchanged, and describes exactly the files in that commit, and 1 when it
+was edited, the commit was amended with other content, or the commit names
+no record. The record lives on the machine that made it; an SBOM isn't
+regenerated yet when dependencies change.
+
 Sandboxed commands can't reach the macOS keychain (the profile refuses its
 daemon). On Linux the session bus is out of their reach with the checker on
 or the network off; that path is not separately tested. A process outside the
@@ -595,6 +605,7 @@ this table applies.
 | Writes only in the workspace, added folders and temp | Yes | Yes, file metadata included: the rest of the tree is read-only. Plus all of `/dev` and the real `/tmp` | Contents yes — a write, rename, link, create, `mkdir` or remove outside is refused — plus all of `/dev` and the real `/tmp`. A file's metadata outside stays writable (`chmod`, `chown`, `utime`, xattrs), and below ABI 3 truncation is seccomp's (see Older kernels). bwn uses its namespace backend instead where user namespaces are allowed | Yes | `bwrap_confines_writes_to_the_workspace`, `invariant_userns_confines_metadata_outside`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `a_confined_command_can_write_inside_and_not_outside`, `invariant_landlock_confines_write_syscall_paths_outside`, `landlock_does_not_confine_file_metadata_outside`, `seatbelt_profile_denies_writes_except_workspace_and_tmp` |
 | `.git` and `.buildwithnexus` read-only | Yes | Yes | No: the posture check says so and auto mode asks before every command (roadmap 2.2) | Yes | `bwrap_argv_keeps_git_and_settings_read_only`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks`, `seatbelt_profile_denies_writes_except_workspace_and_tmp` |
 | Nested repositories' `.git` read-only | Up to 64 found in 10,000 folders, skipping `node_modules` and `target`. Past those bounds the posture check says so | Same bounds as bubblewrap | No | Same bounds as bubblewrap | `nested_repositories_stay_read_only_too`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_nested_git_past_the_bounds_is_disclosed` |
+| `git add` and `commit` from a command, with hooks and config unchanged | Yes: `git` in a command is bwn's, which runs the real one outside with listed subcommands and options, no hooks, in the repositories found at the start. Fetch and pull from a configured HTTPS or SSH remote whose host the network rules allow, with your credentials kept outside. No push | Same as bubblewrap | No: `.git` isn't read-only there, so git isn't run for commands | Same as bubblewrap | `invariant_au5_planted_git_hooks_and_config_never_run`, `invariant_au5_only_listed_git_subcommands_and_options_pass`, `invariant_au5_a_repository_made_later_or_above_is_not_served`, `invariant_au5_the_brokered_git_runs_no_pager_diff_program_or_hook`, `invariant_au5_fetch_reaches_only_allowed_remote_hosts` |
 | Credential stores unreadable | Folders yes, contents and names. A hidden file is covered by an empty file, so its contents are hidden but whether it exists still shows | Folders: contents and names (an empty folder covers each store, so a guessed name is not found). A hidden file's contents are hidden, but whether it exists still shows | Contents yes. Listing the folder is refused, so names can't be enumerated, but `stat` of a guessed name confirms it exists and a file's metadata stays writable (bwn's namespace backend closes both where user namespaces are allowed). Listing is blocked by also refusing to list `/`, `/home`, your home folder and `~/.config` (files in them stay readable by name) | Yes | `bwrap_hides_credential_stores`, `landlock_hides_credential_stores`, `invariant_m5_landlock_does_not_list_hidden_store_names`, `landlock_credential_names_leak_via_stat`, `invariant_userns_hides_store_names`, `invariant_userns_command_cannot_undo_the_mounts`, `seatbelt_hides_credential_stores` |
 | The OS keychain unreachable | Not claimed: the Secret Service on the session bus is not tested here (bubblewrap's `/run` is empty and the bus address is stripped) | Not claimed: as bubblewrap, and the bus socket may be reachable with the network open | Not claimed: as the namespace backend | Yes: the keychain daemon's services are refused, so a command can't read an item, git's stored GitHub token included | `invariant_seatbelt_keychain_is_unreachable` (it read the item back before the fix) |
 | A store that contains the workspace hidden | No: the posture check says the stores are readable and auto mode asks before commands | No: as bubblewrap | No: as bubblewrap | No: as bubblewrap | `invariant_a_store_holding_the_workspace_is_never_claimed_hidden`, and `invariant_g3_no_home_folder_means_nothing_is_claimed_hidden` for the no-home case |
@@ -624,6 +635,25 @@ workspace, so on Landlock alone a command can write them; the posture check
 says so, and auto mode asks before every command on that backend. On Linux
 with bubblewrap, `/tmp` is a fresh private directory that is discarded when
 the command exits.
+
+Git still works from a command (roadmap 3.3). Where `.git` is read-only,
+`git` on a command's PATH is bwn's own binary, which passes its arguments
+through the session's egress proxy, with a per-session token, to bwn. bwn
+runs the real git outside the sandbox only for the repositories it found
+when the session started (a `.git` a command makes later, or one above the
+workspace, is refused), for listed subcommands with listed options (`add`,
+`commit -m`, `stash`, `rebase`, `merge`, `switch`, `reset`, `restore` and the
+read-only ones; nothing that executes, reads a file of the command's
+choosing or writes git's configuration), with path arguments kept in the
+workspace and out of the credential stores, in a fixed environment with no
+hooks, fsmonitor, pager, editor or external diff. A read-only session or a
+review gets no mutating subcommand. Every answer is in the decision log.
+Your own git hooks don't run for these commits. `fetch` and `pull` go the
+same way to a remote the repository names (never a URL or path the command
+gives), resolved with its `insteadOf` rules, over HTTPS or SSH only, to a
+host the session's network rules allow; git there uses your SSH agent and
+credential helpers, which the sandbox never sees. `push` isn't brokered. On
+Landlock alone, where a command could have planted the config, nothing is.
 
 The user's credential stores cannot be read from inside it, whatever path a
 command uses to reach them: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`,
@@ -730,7 +760,7 @@ fail, the model gets the report and another round, at most twice a turn,
 and the run ends with `check_work_failed` (exit 7) and the verifier's
 status `failed`. A rule or hook that refuses them makes the run
 `approval_blocked` (exit 3), with the checks among its denials. The limits
-today (roadmap 3.8 closes the second):
+today:
 
 - **A project with no checks finishes unchecked.** bwn runs the `checks`
   setting, or, without one, what it detects from `Cargo.toml`,
@@ -739,12 +769,24 @@ today (roadmap 3.8 closes the second):
   `["true"]` to switch them off. With none of those, or every detected
   checker missing, a change finishes unchecked; a check the setting names
   that can't run fails.
-- **Edits are committed before any check.** With `auto_commit` on (the
-  default), each file edit is committed when it is made, so a run that ends
-  with failing checks leaves those commits in place.
+- **Uncommitted when it fails.** With `auto_commit` on, a turn's file-tool
+  edits are committed once, at its end, and only when its checks didn't
+  fail and the verifier didn't block; otherwise they stay as uncommitted
+  changes until a later turn passes. Edits a shell command made aren't
+  committed by bwn.
 - **Checks nobody can approve are not run.** Under `ask` or `accept-edits`
   with no terminal, the run prints "checks were not run" and can still end
   as `success`; `--permission-mode auto` runs them unattended.
+- **Security gates are opt-in.** `security_gates` turns on gitleaks and
+  osv-scanner as blocking gates; without it, no scanner runs on its own.
+- **A scanner's report decides, not the scanner.** A check with a
+  `format` passes only when its SARIF or JSON report parses and holds no
+  finding at its `fail_on` level; a crash or garbage output fails it.
+- **Reviews need a real check.** The verifier's security review is met by
+  a passing `security` check from the `checks` setting; the dependency
+  reviews (license, vulnerability, maintenance) only by a person's
+  `BWN_CHECKS_DONE` until bwn runs scanners for them. A tool's name,
+  such as a web search, meets none of them.
 - **The model can still weaken the tests themselves.** bwn pins which
   checks run, not what the project's test files contain.
 - **ACP has no failure stop reason.** A turn over failing checks ends with

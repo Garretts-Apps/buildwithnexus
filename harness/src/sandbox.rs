@@ -690,6 +690,14 @@ fn bwrap_argv(
             a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
         }
     }
+    // git through bwn (roadmap 3.3): the shim's folder, read-only, past
+    // the private /tmp.
+    if protect {
+        if let Some((dir, _)) = crate::gitbroker::shim() {
+            let d = dir.to_string_lossy().into_owned();
+            a.extend(["--ro-bind".to_string(), d.clone(), d]);
+        }
+    }
     a.extend(["--chdir", &cwd, "--"].map(str::to_string));
     // Out only through the proxy: bwn itself, bound in where no hidden path
     // can cover it, limits the network and then runs the command.
@@ -1158,6 +1166,18 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
     for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
     }
+    // `git` is the shim, first on PATH, with the broker's token; it reaches
+    // bwn through the proxy (roadmap 3.3).
+    if let Some((dir, token)) = crate::gitbroker::shim() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = std::ffi::OsString::from(dir);
+        if !path.is_empty() {
+            joined.push(":");
+            joined.push(path);
+        }
+        c.env("PATH", joined)
+            .env(crate::gitbroker::TOKEN_ENV, token);
+    }
     if let Some(port) = net_for(backend).checker_port() {
         for k in crate::egress::UNSET_ENV {
             c.env_remove(k);
@@ -1263,11 +1283,15 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
 /// Appended to a sandboxed command's output when it died writing `.git`.
 pub const GIT_WRITE_BLOCKED: &str = "\
 sandboxed commands cannot write .git, so a hook or git config they plant \
-cannot run later outside the sandbox. git fetch, git pull, and git commit \
-from the shell fail for that reason. bwn still commits its own file edits \
-outside the sandbox when auto_commit is on. Tell the user which git step was \
-refused and leave it to them; changing the sandbox is their decision, so do \
-not suggest switching it off to get around this.";
+cannot run later outside the sandbox. `git` in a sandboxed command is bwn's: \
+add, commit, stash, rebase, merge, switch, reset, restore and the read-only \
+subcommands, and fetch and pull from a configured HTTPS or SSH remote the \
+network rules allow, go through bwn with plain options; git config, hooks \
+and push don't. Calling another git binary directly fails here. bwn \
+still commits its own file edits outside the sandbox when auto_commit is on. Tell \
+the user which git step was refused and leave it to them; changing the \
+sandbox is their decision, so do not suggest switching it off to get around \
+this.";
 
 /// Why a failed sandboxed command could not update `.git`, when the output
 /// says so. `None` when this does not look like that denial.

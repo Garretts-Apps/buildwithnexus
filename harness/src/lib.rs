@@ -51,6 +51,8 @@ pub mod checkpoint;
 pub mod config;
 mod debug_panel;
 pub mod egress;
+pub mod evidence;
+pub mod gitbroker;
 pub mod graphics;
 pub mod highlight;
 pub mod hooks;
@@ -440,6 +442,16 @@ fn exit_quietly_on_closed_stdout() {
 }
 
 pub fn run() {
+    // Run as `git` inside a sandbox: hand the arguments to bwn's broker
+    // (roadmap 3.3).
+    if std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .is_some_and(|p| p.file_name().is_some_and(|n| n == gitbroker::SHIM_NAME))
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(gitbroker::shim_main(&args));
+    }
     // Inside bubblewrap: limit the network, then become the command.
     #[cfg(target_os = "linux")]
     {
@@ -602,6 +614,7 @@ pub fn run() {
         }
         "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
         "audit" => std::process::exit(audit::cli(&args[1..])),
+        "evidence" => std::process::exit(evidence::cli(&args[1..])),
         "review" => {
             let req = match ReviewRequest::parse(&args[1..]) {
                 Ok(r) => r,
@@ -2585,6 +2598,7 @@ fn usage_text() -> String {
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
          \x20 buildwithnexus audit head|path   a session's decision-log head (from the keyring) or file\n\
+         \x20 buildwithnexus evidence verify <commit>   check a commit bwn made against its evidence record\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
          \x20 buildwithnexus system-prompt show|edit|suggest|reset|path\n\
          \x20                               the system prompt (--json on show)\n\

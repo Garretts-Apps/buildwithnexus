@@ -239,7 +239,9 @@ impl std::fmt::Display for Effort {
 }
 
 /// One entry of `checks`: a command, or a command with a name and a kind
-/// (`build`, `test` or `lint`, for `check_work`'s `only`; default `test`).
+/// (`build`, `test`, `lint` or `security`, for `check_work`'s `only`;
+/// default `test`). A passing `security` check meets the verifier's
+/// security-review requirement.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CheckSpec {
@@ -250,6 +252,20 @@ pub enum CheckSpec {
         command: String,
         #[serde(default)]
         kind: Option<String>,
+        /// How the result is read (roadmap 3.4): `"exit"` (the default, the
+        /// exit status), `"sarif"` (SARIF 2.1.0) or `"json"` (an array of
+        /// findings, or an object holding one). With a report, the check
+        /// passes only when it parses and holds no finding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+        /// The lowest SARIF level that fails the check: `"error"` (the
+        /// default), `"warning"` or `"note"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fail_on: Option<String>,
+        /// A file the command writes its report to, read instead of its
+        /// output. Removed before the command runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
 }
 
@@ -262,11 +278,32 @@ impl CheckSpec {
                 name,
                 command,
                 kind,
+                ..
             } => (
                 name.clone().unwrap_or_else(|| command.clone()),
                 kind.clone().unwrap_or_else(|| "test".into()),
                 command.clone(),
             ),
+        }
+    }
+}
+
+impl CheckSpec {
+    /// The report a check produces: (format, fail_on, output file), when
+    /// its result is read from a report rather than its exit status.
+    pub fn report(&self) -> Option<(String, String, Option<String>)> {
+        match self {
+            CheckSpec::Named {
+                format: Some(f),
+                fail_on,
+                output,
+                ..
+            } if f != "exit" => Some((
+                f.clone(),
+                fail_on.clone().unwrap_or_else(|| "error".into()),
+                output.clone(),
+            )),
+            _ => None,
         }
     }
 }
@@ -424,6 +461,12 @@ pub struct Settings {
     /// project file's list waits for trust, like its hooks: it runs code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<CheckSpec>>,
+    /// Scanners every change must pass (roadmap 3.5): `"secrets"`
+    /// (gitleaks, on every change) and `"dependencies"` (osv-scanner, when
+    /// a manifest or lockfile changed). A listed scanner that isn't
+    /// installed blocks too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_gates: Vec<String>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -561,6 +604,7 @@ impl Default for Settings {
             network: NetworkRules::default(),
             shell_env_passthrough: Vec::new(),
             checks: None,
+            security_gates: Vec::new(),
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),
