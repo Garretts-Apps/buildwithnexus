@@ -6,7 +6,10 @@
       "manager": "npm",
       "package": "buildwithnexus",
       "version": "0.21.0",
-      "bins": ["bwn", "buildwithnexus"],
+      "bins": [
+        "bwn",
+        "buildwithnexus"
+      ],
       "bootstrap_release_binary": true
     },
     {
@@ -14,21 +17,27 @@
       "manager": "npm",
       "package": "@anthropic-ai/claude-code",
       "version": "2.1.325",
-      "bins": ["claude"]
+      "bins": [
+        "claude"
+      ]
     },
     {
       "id": "codex",
       "manager": "npm",
       "package": "@openai/codex",
       "version": "0.169.0",
-      "bins": ["codex"]
+      "bins": [
+        "codex"
+      ]
     },
     {
       "id": "gemini",
       "manager": "npm",
       "package": "@google/gemini-cli",
       "version": "0.68.0",
-      "bins": ["gemini"]
+      "bins": [
+        "gemini"
+      ]
     },
     {
       "id": "opencode",
@@ -36,14 +45,37 @@
       "package": "opencode-ai",
       "version": "1.19.5",
       "repository": "https://github.com/sst/opencode",
-      "bins": ["opencode"]
+      "bins": [
+        "opencode"
+      ]
     },
     {
       "id": "aider",
       "manager": "pip",
       "package": "aider-chat",
       "version": "0.86.2",
-      "bins": ["aider"]
+      "bins": [
+        "aider"
+      ],
+      "python": "3.12"
+    },
+    {
+      "id": "copilot",
+      "manager": "npm",
+      "package": "@github/copilot",
+      "version": "1.0.117",
+      "bins": [
+        "copilot"
+      ]
+    },
+    {
+      "id": "crush",
+      "manager": "npm",
+      "package": "@charmland/crush",
+      "version": "0.104.0",
+      "bins": [
+        "crush"
+      ]
     }
   ],
   "commands": [
@@ -95,6 +127,20 @@
       "install": "aider",
       "bin": "aider",
       "version_expect": "0.86.2"
+    },
+    {
+      "id": "copilot",
+      "display": "Copilot CLI",
+      "install": "copilot",
+      "bin": "copilot",
+      "version_expect": "1.0.117"
+    },
+    {
+      "id": "crush",
+      "display": "Crush",
+      "install": "crush",
+      "bin": "crush",
+      "version_expect": "0.104.0"
     }
   ],
   "startup_runs": 20,
@@ -105,18 +151,33 @@
   "task_timeout_s": 90,
   "task_text": "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.",
   "prompts": {
-    "bwn-native": {"pattern": "permission:"},
-    "bwn-npm": {"pattern": "permission:"},
-    "claude": {"pattern": null},
-    "codex": {"pattern": "Ask Codex to do anything"},
-    "gemini": {"pattern": null},
-    "opencode": {"pattern": "Ask anything"},
+    "bwn-native": {
+      "pattern": "permission:"
+    },
+    "bwn-npm": {
+      "pattern": "permission:"
+    },
+    "claude": {
+      "pattern": null
+    },
+    "codex": {
+      "pattern": "Ask Codex to do anything"
+    },
+    "gemini": {
+      "pattern": null
+    },
+    "opencode": {
+      "pattern": "Ask anything"
+    },
     "aider": {
       "pattern": "\n> ",
       "args": [
-        "--model", "openai/gpt-4o-mini",
-        "--openai-api-base", "http://127.0.0.1:9/v1",
-        "--openai-api-key", "sk-bench",
+        "--model",
+        "openai/gpt-4o-mini",
+        "--openai-api-base",
+        "http://127.0.0.1:9/v1",
+        "--openai-api-key",
+        "sk-bench",
         "--no-git",
         "--no-gitignore",
         "--no-check-update",
@@ -127,5 +188,8 @@
         "--no-fancy-input"
       ]
     }
+  },
+  "not_measured": {
+    "goose": "Goose ships as a GitHub release binary and an install script, not an npm or pip package; this suite installs only from npm and pip, so it is not measured."
   }
 }

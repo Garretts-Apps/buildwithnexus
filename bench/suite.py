@@ -65,6 +65,12 @@ def base_env(home: Path, extra: dict | None = None) -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false",
     }
+    # A machine whose TLS is inspected names its CA in these: downloads
+    # (npm, pip, bwn's release binary) need it, and the mock is plain HTTP,
+    # so it changes nothing a tool does against it.
+    for k in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
     if extra:
         env.update(extra)
     return env
@@ -407,7 +413,12 @@ def install_pip(layout: Layout, spec: dict) -> dict:
     if not (marker.is_file() and marker.read_text().strip() == want and venv_py.exists()):
         if prefix.exists():
             shutil.rmtree(prefix)
-        check([sys.executable, "-m", "venv", str(prefix)])
+        # The package's own Python range decides the interpreter (aider
+        # 0.86 needs one below 3.13): pinned in pins.json.
+        py = shutil.which(f"python{spec['python']}") if spec.get("python") else None
+        if spec.get("python") and not py:
+            raise SystemExit(f"{spec['id']} needs python{spec['python']}, which isn't installed")
+        check([py or sys.executable, "-m", "venv", str(prefix)])
         check(
             [str(venv_py), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", want],
             timeout=600,
@@ -697,6 +708,39 @@ def measure_prompt(cmd: dict, installs: dict) -> dict:
         env["BWN_NO_AUTO_UPDATE"] = "1"
     extra = (PINS.get("prompts") or {}).get(cmd["id"]) or {}
     argv = argv + list(extra.get("args") or [])
+    if cmd["id"] == "copilot":
+        # Copilot CLI's own BYOK variables (`copilot help environment`):
+        # an OpenAI-compatible provider, offline, so it needs no GitHub
+        # sign-in and reaches nothing but the mock.
+        env.update({
+            "COPILOT_OFFLINE": "true",
+            "COPILOT_PROVIDER_BASE_URL": base_url,
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_API_KEY": "sk-bench",
+            "COPILOT_MODEL": "bench",
+        })
+        return {
+            "argv": argv + ["-p", TASK_TEXT, "--allow-all"],
+            "env": env,
+            "cwd": str(cwd),
+            "methodology": methodology
+            + " Copilot CLI is pointed at the mock with COPILOT_PROVIDER_BASE_URL and COPILOT_OFFLINE.",
+        }
+    if cmd["id"] == "crush":
+        # A crushrc in the tool's own HOME adds the mock as a provider.
+        rc = home / ".config" / "crush" / "crushrc"
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        rc.write_text(
+            f'provider add bench --type completions --base-url "{base_url}" --api-key "sk-bench"\n'
+            "model add bench/bench --name bench --context-window 8000 --default-max-tokens 100\n"
+        )
+        return {
+            "argv": argv + ["run", "-q", "-m", "bench/bench", TASK_TEXT],
+            "env": env,
+            "cwd": str(cwd),
+            "methodology": methodology
+            + " Crush is pointed at the mock with a crushrc that adds it as an OpenAI-compatible provider.",
+        }
     if cmd["id"] == "aider":
         env["OPENAI_API_KEY"] = "sk-bench"
     if cmd["id"] == "codex":
@@ -844,6 +888,14 @@ def measure_task(cmd: dict, installs: dict, base_url: str, work: Path, mock_requ
         "median_s": median(seconds),
         "mean_s": sum(seconds) / len(seconds),
         "mock_requests_total": len(mock_requests) - before,
+        # What the tool sends the model for the task: the requests and their
+        # bytes (exact; tokens need a real model's tokenizer).
+        "model_requests_per_task": median(
+            [sum(1 for q in r["mock_requests"] if q.get("method") == "POST") for r in runs]
+        ),
+        "request_bytes_per_task": median(
+            [sum(q.get("bytes", 0) for q in r["mock_requests"] if q.get("method") == "POST") for r in runs]
+        ),
         "last_stdout": runs[-1]["stdout"],
     }
 
@@ -1171,6 +1223,23 @@ def render_summary_md(summary: dict) -> str:
             )
         )
     lines.append("")
+    lines.append("## Fixed task against the mock")
+    lines.append("")
+    lines.append("What each tool sends the model for the same one-line task: requests and request bytes (exact; tokens need a real model's tokenizer).")
+    lines.append("")
+    lines.append("| Tool | task median s | model requests | request bytes |")
+    lines.append("|---|---:|---:|---:|")
+    for tid, tool in summary["tools"].items():
+        t = tool.get("task") or {}
+        if not t.get("ok"):
+            lines.append(f"| {tool['display']} | — ({t.get('status', 'not run')}) | — | — |")
+            continue
+        lines.append(
+            f"| {tool['display']} | {t.get('median_s', 0):.3f} | {num(t.get('model_requests_per_task'))} | {num(t.get('request_bytes_per_task'))} |"
+        )
+    for name, why in (summary.get("not_measured") or {}).items():
+        lines.append(f"| {name} | not measured: {why} | | |")
+    lines.append("")
     lines.append("## Where the native binary is not the fastest")
     lines.append("")
     native_losses = []
@@ -1275,6 +1344,7 @@ def execute(results: Path, only: set[str] | None = None) -> dict:
             "environment": "Clean HOME per tool, no API keys except the dummy key used for the mock. PATH starts with that tool's install prefix.",
         },
         "tools": tools,
+        "not_measured": PINS.get("not_measured", {}),
     }
     summary["rankings"] = rankings(tools)
     # Only call the run complete when every required startup and memory sample exists.
