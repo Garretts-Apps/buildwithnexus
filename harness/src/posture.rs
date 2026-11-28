@@ -289,6 +289,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 Level::Good,
                 "off-landlock",
             ),
+            Net::Off if matches!(backend, crate::sandbox::Backend::Userns) => (
+                format!(
+                    "none: the session's private network namespace could not be made ({}); set sandbox_egress_check: false to let commands connect anywhere",
+                    session_net_error()
+                ),
+                Level::Unknown,
+                "off-netns",
+            ),
             Net::Off => (
                 "none: this machine cannot hold commands to the checker (Landlock ABI 4 needed); set sandbox_egress_check: false to let them connect anywhere".to_string(),
                 Level::Unknown,
@@ -845,6 +853,14 @@ pub(crate) fn gather_session_rows_for_test(perm: crate::agent::Permission, cwd: 
 #[cfg(test)]
 pub(crate) fn forget_accepted() {
     *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+// Why the session's network namespace could not be made, for the posture row.
+fn session_net_error() -> String {
+    #[cfg(target_os = "linux")]
+    return crate::netns::session().err().unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    String::new()
 }
 
 #[cfg(test)]

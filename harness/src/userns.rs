@@ -439,7 +439,7 @@ mod tests {
     fn invariant_userns_keeps_the_workspace_writable_and_git_read_only() {
         let Some(c) = Cell::new("rw") else { return };
         let (_, said) = c.run(
-            "echo in > rel.txt && echo REL-OK; echo t > /tmp/bwn-userns-probe && echo TMP-OK; echo x > /dev/null && echo DEV-OK; touch .git/hooks/pre-commit 2>/dev/null && echo GIT-WROTE; touch vendor/lib/.git/hooks/post-checkout 2>/dev/null && echo NESTED-WROTE; mkdir .buildwithnexus/x 2>/dev/null && echo BWN-WROTE; echo end",
+            "echo in > rel.txt && echo REL-OK; echo t > /tmp/bwn-userns-probe-$$ && rm /tmp/bwn-userns-probe-$$ && echo TMP-OK; echo x > /dev/null && echo DEV-OK; touch .git/hooks/pre-commit 2>/dev/null && echo GIT-WROTE; touch vendor/lib/.git/hooks/post-checkout 2>/dev/null && echo NESTED-WROTE; mkdir .buildwithnexus/x 2>/dev/null && echo BWN-WROTE; echo end",
         );
         assert!(said.contains("REL-OK"), "workspace write failed: {said}");
         assert!(said.contains("TMP-OK"), "/tmp write failed: {said}");
@@ -626,7 +626,7 @@ except OSError as e:
     // next command, and bwn's own tools, but not the host.
     #[test]
     fn invariant_netns_servers_persist_and_only_the_session_reaches_them() {
-        use std::io::{Read, Write};
+        use std::io::Read;
         let Some(c) = Cell::new("netns-persist") else {
             return;
         };
@@ -687,10 +687,6 @@ except OSError as e:
             !from_host.contains("HELLO"),
             "the host reached the namespace's server"
         );
-        let mut k = std::net::TcpStream::connect(("127.0.0.1", 1)).ok();
-        if let Some(k) = k.as_mut() {
-            let _ = k.write_all(b"");
-        }
     }
 
     // A request through the checker for a loopback address is dialled in
@@ -757,6 +753,8 @@ except OSError as e:
 
     // A command can't join the host's network namespace (bwn's own), and
     // can't read the holder, a copy of bwn's memory in its user namespace.
+    // Two layers refuse the read: the holder is not dumpable, and Landlock
+    // refuses a sandboxed process ptrace access to one outside its domain.
     #[test]
     fn invariant_netns_command_cannot_join_the_host_or_read_the_holder() {
         let Some(c) = Cell::new("netns-join") else {
@@ -828,5 +826,45 @@ for f in (\"environ\", \"mem\", \"maps\"):\n    try:\n        open(\"/proc/{hold
             Some("INSIDE"),
             "a provider client reached the namespace"
         );
+    }
+
+    // A dev server that binds `localhost` to ::1 alone (Node 17+, Vite) is
+    // found inside the namespace by the tools' client asking for
+    // `localhost`. Skips where the namespace has no IPv6.
+    #[test]
+    fn invariant_netns_tools_find_a_localhost_server_on_ipv6() {
+        let Some(c) = Cell::new("netns-v6") else {
+            return;
+        };
+        let s = crate::netns::session().expect("the session namespace");
+        std::fs::write(
+            c.ws.join("web6.py"),
+            "import socket, os\n\
+             try:\n    s = socket.socket(socket.AF_INET6); s.bind(('::1', 0)); s.listen(8)\n\
+             except OSError as e:\n    print('NOV6', e); raise SystemExit(0)\n\
+             pid = os.fork()\n\
+             if pid:\n    print(s.getsockname()[1], pid, flush=True); os._exit(0)\n\
+             os.setsid(); fd = os.open(os.devnull, os.O_RDWR)\n\
+             for i in (0, 1, 2): os.dup2(fd, i)\n\
+             while True:\n    k, _ = s.accept(); k.recv(4096)\n    \
+             k.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nV6'); k.close()\n",
+        )
+        .unwrap();
+        let (ok, out) = c.run_net("python3 web6.py", crate::landlock::Net::Private(s.port));
+        assert!(ok, "{out}");
+        if out.contains("NOV6") {
+            eprintln!("skip: no IPv6 in the namespace here ({out})");
+            return;
+        }
+        let mut it = out.split_whitespace();
+        let port: u16 = it.next().and_then(|p| p.parse().ok()).expect(&out);
+        let pid: i32 = it.next().and_then(|p| p.parse().ok()).expect(&out);
+        let got = crate::tools::web_client()
+            .get(&format!("http://localhost:{port}/"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert_eq!(got.as_deref(), Some("V6"));
     }
 }

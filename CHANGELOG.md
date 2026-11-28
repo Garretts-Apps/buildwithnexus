@@ -25,6 +25,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Unix sockets, joining the host's namespace, and reading the holder
     process. A further test checks that the namespace holds when that
     process is killed.
+  - A server `start_server` runs there is not on this machine's own
+    loopback, so a browser here can't open it. Its result says so; use
+    `screenshot_url` to see the page.
   - Bubblewrap still holds commands by port; running it in the same
     namespace is next.
 - **On Landlock alone, commands get no network unless you allow it.**

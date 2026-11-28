@@ -367,9 +367,19 @@ fn serve(client: TcpStream, cwd: &Path, private: bool) -> std::io::Result<()> {
     // From the private namespace, "this machine" is the namespace: a
     // loopback target is dialled inside it, never on the host or through an
     // upstream proxy.
-    let inside = private && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback());
+    // A name that resolves to loopback and elsewhere too (a network.allow
+    // entry) still never reaches the host's loopback: its loopback
+    // addresses are dialled inside, the rest as usual, with no upstream
+    // proxy for any of it.
+    let inside = private && addrs.iter().any(|a| a.ip().is_loopback());
     let upstream = match &hop {
-        _ if inside => addrs.iter().find_map(|a| dial_private(*a)),
+        _ if inside => addrs.iter().find_map(|a| {
+            if a.ip().is_loopback() {
+                dial_private(*a)
+            } else {
+                TcpStream::connect_timeout(a, Duration::from_secs(10)).ok()
+            }
+        }),
         // bwn's own proxy carries it: a tunnel to the checked name.
         Some((proxy, auth)) => tunnel(proxy, auth.as_deref(), &label),
         None => addrs

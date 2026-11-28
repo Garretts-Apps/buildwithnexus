@@ -391,21 +391,14 @@ fn handle(stream: std::net::TcpStream) -> Option<String> {
         if loopback_in_session() && is_loopback_host(h) {
             let port = u.port_or_known_default().unwrap_or(80);
             let pending = reader.buffer().to_vec();
-            let ip = h_addr(h);
-            std::thread::spawn(move || forward(stream, ip, port, connect, head, pending));
+            let addrs = crate::netns::loopback_candidates(h, port);
+            std::thread::spawn(move || forward(stream, addrs, connect, head, pending));
             return None;
         }
     }
     let _ = (&stream)
         .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     host
-}
-
-// The loopback address a loopback host name means.
-#[cfg(target_os = "linux")]
-fn h_addr(host: &str) -> std::net::IpAddr {
-    host.parse()
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
 }
 
 // A proxy request's head with its request line in origin form
@@ -445,14 +438,13 @@ fn origin_form(head: &[u8]) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn forward(
     client: std::net::TcpStream,
-    ip: std::net::IpAddr,
-    port: u16,
+    addrs: Vec<std::net::SocketAddr>,
     connect: bool,
     head: Vec<u8>,
     pending: Vec<u8>,
 ) {
     let _ = client.set_read_timeout(None);
-    let Ok(up) = crate::netns::dial_loopback((ip, port).into()) else {
+    let Ok(up) = crate::netns::dial_loopback(&addrs) else {
         let _ = (&client).write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
         return;
     };

@@ -8155,6 +8155,10 @@ fn invariant_netns_screenshot_reaches_a_server_a_command_started() {
         .find(|e| e["type"] == "tool_result" && e["name"] == "start_server")
         .and_then(|e| e["content"].as_str())
         .unwrap_or("");
+    assert!(
+        started.contains("a browser on this machine does not"),
+        "the URL must say where it is reachable: {started}"
+    );
     let log = started
         .lines()
         .find_map(|l| l.strip_prefix("log: "))

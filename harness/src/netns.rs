@@ -69,16 +69,38 @@ pub fn active() -> bool {
     SESSION.get().is_some_and(|r| r.is_ok())
 }
 
-/// A connection to a loopback address for bwn's own tools: inside the
-/// session's namespace if it exists and something listens there, else on
-/// this machine (a server the user started outside bwn).
-pub fn dial_loopback(addr: SocketAddr) -> io::Result<TcpStream> {
+/// A connection to one of `addrs` (loopback) for bwn's own tools: inside
+/// the session's namespace if it exists and something listens there on any
+/// of them, else on this machine (a server the user started outside bwn).
+/// All are tried inside first, so a server bound to `::1` alone, as Node
+/// and Vite bind `localhost`, is found there before the host is asked.
+pub fn dial_loopback(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     if let Some(Ok(s)) = SESSION.get() {
-        if let Ok(t) = s.dial(addr) {
+        if let Some(t) = addrs.iter().find_map(|a| s.dial(*a).ok()) {
             return Ok(t);
         }
     }
-    TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))
+    let mut last = io::Error::from(io::ErrorKind::ConnectionRefused);
+    for a in addrs {
+        match TcpStream::connect_timeout(a, std::time::Duration::from_secs(10)) {
+            Ok(t) => return Ok(t),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The loopback addresses a loopback host means: both families for a
+/// `localhost` name, else the literal.
+pub fn loopback_candidates(host: &str, port: u16) -> Vec<SocketAddr> {
+    let host = host.trim_matches(['[', ']']);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![(ip, port).into()],
+        Err(_) => vec![
+            (std::net::Ipv6Addr::LOCALHOST, port).into(),
+            (std::net::Ipv4Addr::LOCALHOST, port).into(),
+        ],
+    }
 }
 
 /// The namespace descriptors a command joins: the session's, or in a test,
@@ -319,15 +341,16 @@ unsafe fn holder(
                 .clamp(1, 255),
         )
     };
-    // Not dumpable: a command in this user namespace can't ptrace the
-    // holder or read /proc/<pid>/mem (it is a copy of bwn's memory).
-    libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     // Keep none of bwn's descriptors (its connections, its files) but our
     // end of the socketpair and the namespaces to join. It exits when bwn
     // closes its end, which the kernel does when bwn exits. (Not
     // PR_SET_PDEATHSIG: that fires when the forking *thread* exits.)
     close_all_but(&[sock, join.map_or(-1, |j| j.0), join.map_or(-1, |j| j.1)]);
     if let Some((user, net)) = join {
+        // Not dumpable before joining, where commands already are: they
+        // can't ptrace the holder or read /proc/<pid>/mem (it is a copy of
+        // bwn's memory).
+        not_dumpable();
         if libc::setns(user, libc::CLONE_NEWUSER) != 0 || libc::setns(net, libc::CLONE_NEWNET) != 0
         {
             fail();
@@ -348,6 +371,10 @@ unsafe fn holder(
     {
         fail();
     }
+    // Not dumpable from here on. Not before: that makes /proc/self root's,
+    // and an unprivileged holder could no longer write its own maps. Until
+    // the descriptors are sent nothing else is in this namespace.
+    not_dumpable();
     // Bring up lo.
     let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
     if s < 0 {
@@ -401,6 +428,10 @@ unsafe fn holder(
     libc::close(user);
     libc::close(net);
     serve_sockets(sock)
+}
+
+unsafe fn not_dumpable() {
+    libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
 // Close every descriptor from 3 up except `keep`. Stack only.

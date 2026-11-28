@@ -724,6 +724,8 @@ impl ureq::unversioned::resolver::Resolver for Resolve {
 // TCP, with a failure to connect told apart from a failure after it, as
 // ureq 2's ConnectionFailed was: only the first is safe to retry.
 #[derive(Debug)]
+// The bool is Builder::session_loopback (used on Linux only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Dial(TcpConnector, bool);
 
 impl<In: Conn> Connector<In> for Dial {
@@ -742,17 +744,19 @@ impl<In: Conn> Connector<In> for Dial {
             && !details.addrs.is_empty()
             && details.addrs.iter().all(|a| a.ip().is_loopback())
         {
-            let stream = details
-                .addrs
-                .iter()
-                .find_map(|a| crate::netns::dial_loopback(*a).ok())
-                .ok_or_else(|| {
-                    tag(
-                        ErrorKind::ConnectionFailed,
-                        "Connect error",
-                        io::Error::from(io::ErrorKind::ConnectionRefused),
-                    )
-                })?;
+            // A `localhost` name means both families, whatever the resolver
+            // returned: Node and Vite bind it to ::1 alone.
+            let mut addrs: Vec<SocketAddr> = details.addrs.iter().copied().collect();
+            let host = details.uri.host().unwrap_or("");
+            if host.parse::<std::net::IpAddr>().is_err() && !host.starts_with('[') {
+                for a in crate::netns::loopback_candidates(host, addrs[0].port()) {
+                    if !addrs.contains(&a) {
+                        addrs.push(a);
+                    }
+                }
+            }
+            let stream = crate::netns::dial_loopback(&addrs)
+                .map_err(|e| tag(ErrorKind::ConnectionFailed, "Connect error", e))?;
             let config = details.config;
             let buffers = LazyBuffers::new(config.input_buffer_size(), config.output_buffer_size());
             return Ok(Some(Either::B(Bridged { stream, buffers })));
@@ -777,6 +781,7 @@ impl<In: Conn> Connector<In> for Dial {
 // A connection bwn dialled itself (a loopback server in the session's
 // private network namespace, netns.rs).
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Bridged {
     stream: std::net::TcpStream,
     buffers: LazyBuffers,
