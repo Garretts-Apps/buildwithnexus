@@ -10,7 +10,7 @@ cp "$K/bwn-tests" /root/bwn-tests
 cp "$K/bwn" /root/buildwithnexus
 chmod +x /root/bwn-tests /root/buildwithnexus
 cd /root
-for t in landlock:: invariant_m2 invariant_m5 invariant_m8c invariant_sec1 invariant_userns sandbox::tests::landlock; do
+for t in landlock:: invariant_m2 invariant_m5 invariant_m8c invariant_sec1 invariant_userns invariant_netns sandbox::tests::landlock; do
   echo "--- $t"
   BWN_TEST_SANDBOX_BACKEND=landlock BWN_TEST_CONFINE_EXE=/root/buildwithnexus \
     ./bwn-tests --test-threads=1 --nocapture "$t" 2>&1 \
@@ -19,5 +19,7 @@ for t in landlock:: invariant_m2 invariant_m5 invariant_m8c invariant_sec1 invar
   # A named filter that matches no test is a lost test, not a pass.
   grep -q "test result: ok. 0 passed" /root/out.txt && echo "EMPTY FILTER: $t"
 done
+. /etc/os-release
+[ "$VERSION_ID" = "24.04" ] && sh "$K/userns-probe.sh"
 echo "=== PROBE END"
 poweroff

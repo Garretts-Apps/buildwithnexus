@@ -411,6 +411,53 @@ The owner has set five requirements. This backend, and bubblewrap, must meet
 them. The same helper that builds the mount tree is where the network is cut
 off, so they belong in this design.
 
+### As built (namespace backend)
+
+The sections below were written before the build. What shipped is simpler
+than the per-command design they describe. The owner chose one namespace per
+session.
+
+- **No forwarder process and no Unix socket.** A holder process, forked from
+  bwn, makes the user and network namespace, brings up `lo` and binds the
+  checker's listener on `127.0.0.1` inside. It sends bwn three descriptors
+  over a socketpair: the listener and its two namespaces. bwn serves that
+  listener with its checker directly. A socket created in a namespace stays
+  in it, so connections accepted on it come from inside.
+- **Joining.** Each command `setns`es into the holder's user and network
+  namespaces, then makes its own mount namespace. The mapping is already
+  written, so it is not written again. The Landlock network rule is not
+  needed: the namespace holds nothing else. Seccomp still allows only TCP
+  sockets, so pathname Unix sockets in the shared file tree, such as the SSH
+  agent's, stay unreachable.
+- **The holder.** It is not dumpable, so a command in its user namespace can't
+  ptrace it or read its memory, which is a copy of bwn's. It closes every
+  descriptor it inherited except the socketpair. It exits when bwn closes its
+  end.
+
+  It does not use `PR_SET_PDEATHSIG`: that signal fires when the forking
+  *thread* exits, which killed the holder in testing. bwn keeps the namespace
+  descriptors, so the namespace outlives the holder. A holder that dies is
+  replaced by one that joins the same namespace.
+- **bwn's own tools.** The tools' HTTP client tries the namespace first for
+  loopback addresses, then this machine. The holder makes the sockets for
+  that, since a socket made in the namespace connects there. Chrome's
+  loopback requests go through the screenshot proxy to the same dialer.
+  Provider clients never do, so a command can't answer as a local model
+  server.
+- **The checker.** A request through the checker for `localhost` is dialled
+  in the namespace, never on the host or through an upstream proxy.
+- **Ubuntu 24.04.** With AppArmor's default user-namespace restriction, an
+  unprivileged user gets no working user namespace at all. Even the
+  distribution's bubblewrap fails its loopback setup there. bwn runs on
+  Landlock alone, with no network until the user allows it (field cell
+  `noble`).
+- **Bubblewrap.** Started after `setns` into the session's namespaces,
+  bubblewrap works with `--unshare-all --share-net`; this was checked by hand
+  as an unprivileged user. Wiring that in is the next step.
+
+Tests: `invariant_netns_*` in `harness/src/userns.rs` and
+`tests/integration.rs`.
+
 ### What bwn does today
 
 A command with the network checked (`Net::Proxy`) runs in the host's network

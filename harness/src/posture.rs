@@ -278,6 +278,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         allowed.sort();
         let allow = allowed.len();
         let checked = format!("checked:{}", allowed.join(","));
+        let private = format!("private:{}", allowed.join(","));
         let landlock_alone = matches!(backend, crate::sandbox::Backend::Landlock);
         let (nv, nl, nk) = match net {
             Net::Off if !crate::sandbox::network() => {
@@ -287,6 +288,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 "none: on Landlock alone commands are held to the checker by port, not address, so the network is off; type /sandbox network (or pass --sandbox-network) to allow it for this session, or install bubblewrap".to_string(),
                 Level::Good,
                 "off-landlock",
+            ),
+            Net::Off if matches!(backend, crate::sandbox::Backend::Userns) => (
+                format!(
+                    "none: the session's private network namespace could not be made ({}); set sandbox_egress_check: false to let commands connect anywhere",
+                    session_net_error()
+                ),
+                Level::Unknown,
+                "off-netns",
             ),
             Net::Off => (
                 "none: this machine cannot hold commands to the checker (Landlock ABI 4 needed); set sandbox_egress_check: false to let them connect anywhere".to_string(),
@@ -300,6 +309,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 ),
                 Level::Good,
                 checked.as_str(),
+            ),
+            Net::Private(_) => (
+                format!(
+                    "only through the checker, from a private network namespace: {} package and source hosts, hosts you name, {allow} in network.allow; servers commands start reach each other, this machine's own services don't",
+                    crate::egress::KNOWN_HOSTS.len()
+                ),
+                Level::Good,
+                private.as_str(),
             ),
             Net::Open => (
                 "any host (sandbox_egress_check: false)".to_string(),
@@ -836,6 +853,14 @@ pub(crate) fn gather_session_rows_for_test(perm: crate::agent::Permission, cwd: 
 #[cfg(test)]
 pub(crate) fn forget_accepted() {
     *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+// Why the session's network namespace could not be made, for the posture row.
+fn session_net_error() -> String {
+    #[cfg(target_os = "linux")]
+    return crate::netns::session().err().unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    String::new()
 }
 
 #[cfg(test)]

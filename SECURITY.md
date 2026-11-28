@@ -507,11 +507,11 @@ this table applies.
 | Nested repositories' `.git` read-only | Up to 64 found in 10,000 folders, skipping `node_modules` and `target` | Same bounds as bubblewrap | No | Same bounds as bubblewrap | `nested_repositories_stay_read_only_too`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only` |
 | Credential stores unreadable | Folders yes, contents and names. A hidden file is covered by an empty file, so its contents are hidden but whether it exists still shows | Folders: contents and names (an empty folder covers each store, so a guessed name is not found). A hidden file's contents are hidden, but whether it exists still shows | Contents yes. Listing the folder is refused, so names can't be enumerated, but `stat` of a guessed name confirms it exists and a file's metadata stays writable (bwn's namespace backend closes both where user namespaces are allowed). Listing is blocked by also refusing to list `/`, `/home`, your home folder and `~/.config` (files in them stay readable by name) | Yes | `bwrap_hides_credential_stores`, `landlock_hides_credential_stores`, `invariant_m5_landlock_does_not_list_hidden_store_names`, `landlock_credential_names_leak_via_stat`, `invariant_userns_hides_store_names`, `invariant_userns_command_cannot_undo_the_mounts`, `seatbelt_hides_credential_stores` |
 | A store that contains the workspace hidden | No | No (auto mode asks) | No (auto mode asks) | No | `invariant_g3_no_home_folder_means_nothing_is_claimed_hidden` covers the no-home case |
-| SSH agent socket unreachable | Yes | Only while the network is checked or off | Only while the network is checked or off | Yes | `invariant_bwrap_agent_socket_is_unreachable`, `invariant_userns_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_profile_denies_reads_of_hidden_paths` |
-| Network only through the host checker | Through the checker, held by port: the checker's port on another address also connects until the private network namespace lands (roadmap 2.2). Only plain TCP sockets. No network if bwn's own binary can't be found | As bubblewrap: through the checker, held by port, only plain TCP sockets (the private network namespace is roadmap 2.2) | No network, unless the user allows it for the session (`/sandbox network`, `--sandbox-network`): Landlock alone holds a command by port only, and no private network namespace is possible here. Once allowed, with Landlock ABI 4 (kernel 6.7), as bubblewrap | Yes | `bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `invariant_userns_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`, `invariant_landlock_alone_has_no_network_until_allowed` |
-| No inbound connections | No: a command can listen | No | No | No | Not guaranteed |
+| SSH agent socket unreachable | Yes | Yes while the network is checked or off: only TCP sockets, in the session's private network namespace | Only while the network is checked or off | Yes | `invariant_bwrap_agent_socket_is_unreachable`, `invariant_userns_limits_the_network_to_the_proxy`, `invariant_netns_command_reaches_only_the_checker`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_profile_denies_reads_of_hidden_paths` |
+| Network only through the host checker | Through the checker, held by port: the checker's port on another address also connects until the private network namespace lands (roadmap 2.2). Only plain TCP sockets. No network if bwn's own binary can't be found | Yes: each command joins the session's private network namespace, which holds only loopback and the checker, on any Landlock ABI. Only plain TCP sockets; no DNS. Through the checker, `localhost` is the namespace, not this machine. Servers a command starts reach later commands and bwn's own tools (fetch, `wait_for_url`, `screenshot_url`), not model providers | No network, unless the user allows it for the session (`/sandbox network`, `--sandbox-network`): Landlock alone holds a command by port only, and no private network namespace is possible here. Once allowed, with Landlock ABI 4 (kernel 6.7), as bubblewrap | Yes | `bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `invariant_userns_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`, `invariant_landlock_alone_has_no_network_until_allowed`, `invariant_netns_command_reaches_only_the_checker`, `invariant_netns_checker_does_not_reach_host_loopback`, `invariant_netns_holds_when_its_holder_dies`, `invariant_netns_command_cannot_join_the_host_or_read_the_holder`, `invariant_netns_tools_reach_session_servers_and_providers_do_not`, `invariant_netns_screenshot_reaches_a_server_a_command_started` |
+| No inbound connections | No: a command can listen | Yes: nothing outside the session's namespace can connect in; a server there answers later commands and bwn's own tools only | No | No | `invariant_netns_servers_persist_and_only_the_session_reaches_them`; not guaranteed elsewhere |
 | Provider keys and tokens stripped from the environment | Yes | Yes | Yes | Yes (and with no backend) | `sandboxed_children_lose_sockets_and_provider_keys` |
-| Older kernels | n/a | As Landlock alone; the namespace needs `mount_setattr` (kernel 5.12), which every Landlock kernel has | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold. Landlock can't confine truncation there, so seccomp refuses `truncate(2)` and a read-only `open` with `O_TRUNC`, inside the workspace too (write-mode truncation — `: > file`, `ftruncate`, opening for writing with `O_TRUNC` — still works, because Landlock confines it); the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, `invariant_userns_confines_metadata_outside`, run in 5.15 and 6.1 VMs |
+| Older kernels | n/a | As Landlock alone, except the network: the private namespace holds it on every ABI, so commands get the checker below ABI 4 too. The namespace needs `mount_setattr` (kernel 5.12), which every Landlock kernel has | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold. Landlock can't confine truncation there, so seccomp refuses `truncate(2)` and a read-only `open` with `O_TRUNC`, inside the workspace too (write-mode truncation — `: > file`, `ftruncate`, opening for writing with `O_TRUNC` — still works, because Landlock confines it); the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, `invariant_userns_confines_metadata_outside`, run in 5.15 and 6.1 VMs |
 
 <!-- capabilities:end -->
 
@@ -549,12 +549,30 @@ refuse UDP and Unix sockets; a Seatbelt rule on macOS). It lets through ports
 443 and 80 to package and source hosts, hosts the user named in a message,
 and `network.allow`; private, link-local and metadata addresses are refused
 unless `network.allow` names them; this machine's own servers stay reachable.
-On Linux the kernel rule is by port, so a command could still reach another
-machine on the checker's own port, which is random per session; a private
-network namespace per session will close that (roadmap 2.2). On Landlock
-alone, where no namespace is possible, commands get no network unless you
-allow it for the session with `/sandbox network` or `--sandbox-network`.
-Without Landlock ABI 4, commands get no network. `"sandbox_network": false` blocks it
+On bwn's namespace backend every command joins one private network
+namespace made for the session. It holds only a loopback interface and the
+checker's listener, so a command cannot reach the internet, the local network
+or this machine's own services except through the checker, on any Landlock
+ABI. It has no DNS. Through the checker, `localhost` means the namespace, not
+this machine.
+
+Servers a command starts stay reachable from later commands and from bwn's own
+tools (fetch, `wait_for_url`, `screenshot_url`, which try the namespace first,
+then this machine). Model providers on loopback are never dialled there, so a
+command cannot stand in for one. Nothing outside the session can connect in.
+
+The namespace is made by a small holder process forked from bwn. It is not
+dumpable, so a command cannot read its memory. bwn keeps the namespace open
+for the session and replaces a holder that dies.
+
+On bubblewrap the kernel rule is still by port, so a command could reach
+another machine on the checker's own port, which is random per session.
+Running bubblewrap inside the same namespace is next (roadmap 2.2).
+
+On Landlock alone, where no namespace is possible (Ubuntu 24.04 with
+AppArmor's default user-namespace restriction, for example), commands get no
+network unless you allow it for the session with `/sandbox network` or
+`--sandbox-network`. Without Landlock ABI 4 they get none there. `"sandbox_network": false` blocks it
 entirely; `"sandbox_egress_check": false` removes the checker.
 
 Data can still leave through an allowed host (publishing a package, for

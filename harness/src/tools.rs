@@ -2554,6 +2554,21 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
         Ok(c) => c,
         Err(e) => return err(e),
     };
+    // On the namespace backend the server runs in the session's private
+    // network namespace (netns.rs): bwn's tools reach it, a browser here
+    // doesn't, so the URL says so.
+    let in_session_net = sandboxed.is_some() && crate::screenshot::loopback_in_session();
+    let url_line = |p: u64| {
+        if in_session_net {
+            format!(
+                "url: http://127.0.0.1:{p} (in the sandbox's private network: later commands and \
+                 bwn's tools, such as screenshot_url and fetch, reach it; a browser on this \
+                 machine does not)"
+            )
+        } else {
+            format!("url: http://127.0.0.1:{p}")
+        }
+    };
     let log_path = server_logs_dir().join(format!("{name}.log"));
     let port = input["port"].as_u64();
 
@@ -2662,8 +2677,7 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
                     record["name"].as_str().unwrap_or("server"),
                     child.id(),
                     log_path.display(),
-                    port.map(|p| format!("url: http://127.0.0.1:{p}"))
-                        .unwrap_or_default()
+                    port.map(url_line).unwrap_or_default()
                 ))
             }
             Err(e) => err(format!("cannot start server: {e}")),
@@ -5026,6 +5040,7 @@ fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
         hole.port,
         direct,
         running_as_root(),
+        screenshot::loopback_in_session(),
     ));
     crate::sandbox::scrub_credentials(&mut cmd);
     let ran = run_with_timeout(cmd, None, SCREENSHOT_TIMEOUT);
@@ -6501,7 +6516,7 @@ use net_guard::*;
 
 mod table;
 pub use net_guard::{blocked_url, private_network_host};
-pub(crate) use net_guard::{is_blocked_ip, is_private_ip};
+pub(crate) use net_guard::{is_blocked_ip, is_private_ip, web_client};
 
 #[cfg(test)]
 mod classify_tests;
