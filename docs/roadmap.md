@@ -262,7 +262,7 @@ engineering integrity and runtime efficiency.
 
 | # | Item | Acceptance |
 |---|---|---|
-| 6.1 | SD-2: the 20-dependent-task longitudinal benchmark (analysis 9.2), across bwn and the competitors that can be pointed at the same model. | Manifest-pinned runs, three per sequence, raw records under `bench/results/`, held-out task portion |
+| 6.1 | SD-2: the 20-dependent-task longitudinal benchmark (analysis 9.2), across bwn and the competitors that can be pointed at the same model. | Manifest-pinned runs, three per sequence, raw records under `bench/results/`, held-out task portion. In progress. Done: `bench/longitudinal/runner.py` (manifest-pinned runs, the harness on its own tree task after task, hidden tests added after each task and accumulating, regressions counted only for tests that had passed, bwn's `--json` tokens, tool calls and denials, a git bundle per task, the manifest and its hash, a generated summary with medians and ranges and the held-out tasks apart) and `select_tasks.py --manifest`; `bench/longitudinal/test_runner.py` (CI) drives it with scripted harnesses. Not yet: scanners and complexity per task, and the live runs, which need a model endpoint none has been provided for. |
 | 6.2 | One-shot security: SusVibes through bwn with gates off and on, and through competitors on the same model. Run first at the end of Milestone 3. | Published with the method |
 | 6.3 | The invariant suite as a cross-harness score: the share of seeded forbidden actions blocked, per surface. | Published per surface, never as one blanket number |
 | 6.4 | CP-6: the efficiency bench refreshed, with Copilot CLI, Crush and Goose added and tokens per task measured. | Stored run |

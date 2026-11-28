@@ -133,3 +133,27 @@ section 9 of `docs/competitor-analysis.md`.
   earlier change in the window touched, and none is a release-sized merge.
   It ranks the windows; writing the requirements and running the harnesses
   are later steps (roadmap 6.1).
+
+## Longitudinal benchmark (roadmap 6.1)
+
+`bench/longitudinal/` runs the twenty-dependent-task benchmark of
+docs/competitor-analysis.md section 9.2.
+
+1. `select_tasks.py <repo> --manifest` picks a window of the repository's
+   history and prints a draft manifest. Each task gets its hidden test
+   files (the tests that change added or modified) and its historical
+   commit, and every fifth task is held out.
+2. A person rewrites each requirement and sets the test command, the
+   harnesses and the model.
+3. `runner.py manifest.json` runs each harness on its own tree, task after
+   task. After each task, the runner adds that task's hidden tests, runs
+   them and every earlier passing task's tests (regressions), and records
+   bwn's `--json` report: tokens, tool calls, denials and outcome. The raw
+   records, a git bundle per task, the manifest and its hash go under
+   `results/<timestamp>/longitudinal/`, and `summary.md` holds the median
+   and range over runs.
+
+`test_runner.py` checks the scoring with scripted harnesses: one applies
+each historical change, one does nothing, and one breaks an earlier task.
+CI runs it. No live run is stored yet: a run needs a model endpoint, and
+none has been provided for one.
