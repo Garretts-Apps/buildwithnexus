@@ -46,6 +46,7 @@
 mod acp;
 pub mod agent;
 pub mod audit;
+pub mod aws;
 pub mod capabilities;
 pub mod checkpoint;
 pub mod config;
@@ -1186,6 +1187,10 @@ fn build_provider_deferring(
     } else if preset.env_key.is_empty() || preset.id == "vertex" {
         // Vertex's credentials are a file, exchanged for a token per request.
         None
+    } else if preset.id == "bedrock" {
+        // A Bedrock API key, or none and an access key signs instead.
+        key.map(str::to_string)
+            .or_else(|| config::load_key(preset.env_key))
     } else {
         key.map(str::to_string)
             .or_else(|| config::load_key(preset.env_key))
@@ -1193,7 +1198,11 @@ fn build_provider_deferring(
     if preset.id == "vertex" && gcp::credentials_path().is_none() {
         return Err("no Google credentials: set GOOGLE_APPLICATION_CREDENTIALS to a service-account key, or run `gcloud auth application-default login`".into());
     }
-    if !preset.env_key.is_empty() && api_key.is_none() && preset.id != "vertex" {
+    if preset.id == "bedrock" && api_key.is_none() && aws::creds().is_none() {
+        return Err("no AWS credentials: set AWS_BEARER_TOKEN_BEDROCK, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a profile in ~/.aws/credentials".into());
+    }
+    if !preset.env_key.is_empty() && api_key.is_none() && !matches!(preset.id, "vertex" | "bedrock")
+    {
         return Err(format!(
             "{} not set; run `buildwithnexus init`",
             preset.env_key
@@ -1216,7 +1225,7 @@ fn build_provider_deferring(
         report::notice(&format!("  ⚠ {w}"));
     }
     let mut context_tokens = match preset.id {
-        "anthropic" | "vertex" => 200_000,
+        "anthropic" | "vertex" | "bedrock" => 200_000,
         _ if preset.local => 8_192,
         _ => 128_000,
     };
@@ -1240,6 +1249,7 @@ fn build_provider_deferring(
     {
         protocol = config::Protocol::OpenAi;
     }
+    let has_key = api_key.is_some();
     let mut provider = Provider {
         protocol,
         base_url,
@@ -1255,6 +1265,8 @@ fn build_provider_deferring(
         auth: match preset.id {
             "azure" => provider::Auth::AzureKey,
             "vertex" => provider::Auth::GoogleToken,
+            "bedrock" if has_key => provider::Auth::AwsBearer,
+            "bedrock" => provider::Auth::AwsSigV4,
             _ => provider::Auth::Standard,
         },
     };

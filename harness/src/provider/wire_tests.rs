@@ -208,6 +208,7 @@ fn anthropic(p: &Provider, msgs: &[Msg], tools: &[ToolDef], stream: bool) -> Vec
         effort: p.effort,
         stream,
         vertex: false,
+        bedrock: false,
     };
     anthropic_bytes(msgs, tools, &shape)
 }

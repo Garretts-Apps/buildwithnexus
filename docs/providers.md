@@ -69,6 +69,38 @@ and any `AWS_*` variable, is removed from their environment.
 - **Hidden from commands:** the key file and gcloud's folder are hidden
   from the commands the agent runs, and so is the variable.
 
+### Claude on Amazon Bedrock
+
+```json
+{
+  "provider": "bedrock",
+  "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+  "model": "us.anthropic.claude-sonnet-4-6"
+}
+```
+
+- **Bedrock API key:** with one in `AWS_BEARER_TOKEN_BEDROCK`, bwn sends
+  it as a Bearer token.
+- **Access key:** without an API key, bwn signs each request in-tree with
+  Signature Version 4 (service `bedrock`). The key comes from
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`,
+  or else from the `AWS_PROFILE` (or `default`) profile in
+  `~/.aws/credentials`. The secret itself is never sent.
+- **Not supported:** SSO and `credential_process` profiles.
+- **Requests:** bwn calls `invoke`, or `invoke-with-response-stream` when
+  it streams. The body is Anthropic's, with
+  `anthropic_version: bedrock-2023-05-31` and no model or stream field.
+- **Streamed replies:** each event-stream frame is checked by both of its
+  CRCs, and a frame that fails either check ends the reply.
+- **Throttling:** Bedrock's throttling reads as a busy model, so
+  `fallback_model` takes over as it does with other providers.
+- **Endpoint:** `base_url` must be
+  `https://bedrock-runtime.REGION.amazonaws.com`. No other host gets the
+  key or a signature.
+- **Hidden from commands:** every `AWS_*` variable is stripped from
+  commands. `~/.aws` and a file named by `AWS_SHARED_CREDENTIALS_FILE`
+  are hidden stores.
+
 ### Subscription sign-in
 
 bwn doesn't offer sign-in with a Claude subscription. Anthropic's terms
@@ -90,3 +122,6 @@ The checks ran against tests, not live cloud accounts:
   against that key's public half.
 - A token exchange against a mock endpoint, with a planted `token_uri`
   that receives nothing.
+- SigV4 signatures against AWS's published test suite (awslabs/aws-c-auth).
+- Event-stream frames with corrupt checksums or oversized lengths.
+- A streamed Bedrock reply and a throttled one.

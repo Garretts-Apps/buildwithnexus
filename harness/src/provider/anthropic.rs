@@ -11,6 +11,9 @@ pub(super) struct AnthropicBody<'a> {
     /// Vertex AI's form: the model is in the URL, and the body names the
     /// API version instead.
     pub(super) vertex: bool,
+    /// Bedrock's form: the model is in the URL, the body names the API
+    /// version, and streaming is the endpoint's, not a field.
+    pub(super) bedrock: bool,
 }
 
 const CACHE_CONTROL: &str = "\"cache_control\":{\"type\":\"ephemeral\"},";
@@ -46,7 +49,9 @@ pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody
     }
 
     let mut j = Json::with_capacity(size_hint(msgs, tools));
-    j.raw(if o.vertex {
+    j.raw(if o.bedrock {
+        "{\"anthropic_version\":\"bedrock-2023-05-31\",\"max_tokens\":"
+    } else if o.vertex {
         "{\"anthropic_version\":\"vertex-2023-10-16\",\"max_tokens\":"
     } else {
         "{\"max_tokens\":"
@@ -135,7 +140,7 @@ pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody
         }
     }
     j.raw("]");
-    if !o.vertex {
+    if !o.vertex && !o.bedrock {
         j.raw(",\"model\":");
         j.str(o.model);
     }
@@ -144,7 +149,7 @@ pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody
         j.raw(o.effort.as_str());
         j.raw("\"}");
     }
-    if o.stream {
+    if o.stream && !o.bedrock {
         j.raw(",\"stream\":true");
     }
     let system = SystemText(msgs);
@@ -289,6 +294,69 @@ pub(super) fn vertex_request(p: &Provider, streaming: bool) -> Result<crate::net
         .post(&at)
         .set("authorization", &format!("Bearer {token}"))
         .set("content-type", "application/json"))
+}
+
+/// A Bedrock InvokeModel request for `p`'s model carrying `body`:
+/// `invoke`, or `invoke-with-response-stream` when streaming. The host is
+/// checked before any credential is touched; then the request carries the
+/// Bedrock API key as a Bearer token, or is signed with SigV4.
+pub(super) fn bedrock_request(
+    p: &Provider,
+    streaming: bool,
+    body: &[u8],
+) -> Result<crate::net::Request, String> {
+    let model = p.model.trim();
+    if model.is_empty() || model.contains(['/', '?', '#']) {
+        return Err(format!("`{}` isn't a Bedrock model id", p.model));
+    }
+    let verb = if streaming {
+        "invoke-with-response-stream"
+    } else {
+        "invoke"
+    };
+    let path_model = crate::aws::uri_encode_segment(model);
+    let at = url(p, &format!("/model/{path_model}/{verb}"));
+    crate::config::cloud_endpoint_ok("bedrock", &at)
+        .map_err(|why| format!("refusing to send AWS credentials: {why}"))?;
+    let parsed = url::Url::parse(&at).map_err(|e| format!("{at}: {e}"))?;
+    let host = parsed.host_str().unwrap_or_default().to_string();
+    let region = crate::aws::region_of(&host)
+        .ok_or_else(|| format!("{host} names no region"))?
+        .to_string();
+    let req = agent()
+        .post(&at)
+        .set("content-type", "application/json")
+        .set("accept", "application/json");
+    match p.auth {
+        Auth::AwsBearer => {
+            let key = p.api_key.as_deref().ok_or("no Bedrock API key")?;
+            Ok(req.set("authorization", &format!("Bearer {key}")))
+        }
+        _ => {
+            let creds = crate::aws::creds().ok_or(
+                "no AWS credentials: set AWS_BEARER_TOKEN_BEDROCK, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a profile in ~/.aws/credentials",
+            )?;
+            let date = crate::aws::amz_date_now();
+            let signed = crate::aws::sign(
+                &crate::aws::Signing {
+                    method: "POST",
+                    path: parsed.path(),
+                    query: &[],
+                    headers: &[
+                        ("host", &host),
+                        ("content-type", "application/json"),
+                        ("accept", "application/json"),
+                    ],
+                    body,
+                    region: &region,
+                    service: "bedrock",
+                    amz_date: &date,
+                },
+                &creds,
+            );
+            Ok(signed.iter().fold(req, |r, (k, v)| r.set(k, v)))
+        }
+    }
 }
 
 // Thinking budgets for the `budget_tokens` form (models before Claude 4.6).

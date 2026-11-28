@@ -51,6 +51,11 @@ pub enum Auth {
     AzureKey,
     /// A Google access token (`gcp`), sent only to a Vertex AI endpoint.
     GoogleToken,
+    /// A Bedrock API key as a Bearer token, only to a Bedrock endpoint.
+    AwsBearer,
+    /// An AWS access key that signs each request (SigV4), only for a
+    /// Bedrock endpoint; the secret itself is never sent.
+    AwsSigV4,
 }
 
 /// The header that carries `p`'s key on an OpenAI-shaped request, or None
@@ -62,7 +67,7 @@ pub(crate) fn openai_key_header(p: &Provider, url: &str) -> Option<(&'static str
         Auth::AzureKey => crate::config::cloud_endpoint_ok("azure", url)
             .is_ok()
             .then(|| ("api-key", key.to_string())),
-        Auth::GoogleToken => None,
+        Auth::GoogleToken | Auth::AwsBearer | Auth::AwsSigV4 => None,
     }
 }
 
@@ -263,6 +268,7 @@ pub mod bench {
             effort: Effort::Medium,
             stream: true,
             vertex: false,
+            bedrock: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -284,6 +290,7 @@ pub mod bench {
             effort: Effort::Off,
             stream: true,
             vertex: false,
+            bedrock: false,
         };
         super::anthropic_bytes(msgs, tools, &shape)
     }
@@ -943,6 +950,16 @@ fn finish(
 
 type Parsers = (StreamParser, fn(Value) -> Result<Reply, String>);
 const ANTHROPIC: Parsers = (anthropic_stream, anthropic_parse);
+const BEDROCK: Parsers = (bedrock_stream, anthropic_parse);
+
+// Bedrock streams Anthropic's events inside AWS event-stream frames.
+fn bedrock_stream(
+    r: InterruptibleReader,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    anthropic_stream(crate::aws::BedrockSse::new(r), on_text, on_thinking)
+}
 const OPENAI: Parsers = (openai_stream, openai_parse);
 const OLLAMA: Parsers = (ollama_stream, ollama_parse);
 
@@ -997,22 +1014,25 @@ fn request_inner(
 ) -> Result<Reply, String> {
     match p.protocol {
         Protocol::Anthropic => {
-            let req = match p.auth {
-                Auth::GoogleToken => vertex_request(p, streaming)?,
-                _ => anthropic_request(p)?,
-            };
+            let bedrock = matches!(p.auth, Auth::AwsBearer | Auth::AwsSigV4);
             let shape = AnthropicBody {
                 model: &p.model,
                 max_tokens: p.max_tokens,
                 effort: p.effort,
                 stream: streaming,
                 vertex: p.auth == Auth::GoogleToken,
+                bedrock,
             };
             let body = anthropic_bytes(msgs, tools, &shape);
+            let req = match p.auth {
+                Auth::GoogleToken => vertex_request(p, streaming)?,
+                _ if bedrock => bedrock_request(p, streaming, &body)?,
+                _ => anthropic_request(p)?,
+            };
             finish(
                 send_raw(req, body)?,
                 streaming,
-                ANTHROPIC,
+                if bedrock { BEDROCK } else { ANTHROPIC },
                 on_text,
                 on_thinking,
             )

@@ -137,6 +137,19 @@ pub const PRESETS: &[Preset] = &[
         more_models: &["deepseek-v4-pro"],
         local: false,
     },
+    // Claude on Amazon Bedrock. The endpoint names the region; a Bedrock
+    // API key is sent as a Bearer token, or else an AWS access key signs
+    // each request (`aws`).
+    Preset {
+        id: "bedrock",
+        label: "Claude on Amazon Bedrock",
+        protocol: Protocol::Anthropic,
+        base_url: "",
+        env_key: "AWS_BEARER_TOKEN_BEDROCK",
+        default_model: "us.anthropic.claude-sonnet-4-6",
+        more_models: &[],
+        local: false,
+    },
     // Claude on Vertex AI. The endpoint names the project and region; the
     // credentials are Google's Application Default Credentials (`gcp`),
     // exchanged for a token only at Google's token endpoint.
@@ -3703,17 +3716,18 @@ fn write_keys_file(map: &BTreeMap<String, String>) {
 }
 
 /// The hosts a cloud preset's credential may go to (roadmap 4.4): one of
-/// these names, or for one that starts with `.` or `-`, a name that ends
-/// in it after a single label of letters, digits and hyphens.
+/// these names, where `*` stands for one label's worth of letters, digits
+/// and hyphens (no dot).
 pub fn cloud_hosts(preset_id: &str) -> &'static [&'static str] {
     match preset_id {
         "azure" => &[
-            ".openai.azure.com",
-            ".services.ai.azure.com",
-            ".cognitiveservices.azure.com",
+            "*.openai.azure.com",
+            "*.services.ai.azure.com",
+            "*.cognitiveservices.azure.com",
         ],
         // The global endpoint, and a region's (`us-east5-aiplatform…`).
-        "vertex" => &["aiplatform.googleapis.com", "-aiplatform.googleapis.com"],
+        "vertex" => &["aiplatform.googleapis.com", "*-aiplatform.googleapis.com"],
+        "bedrock" => &["bedrock-runtime.*.amazonaws.com"],
         _ => &[],
     }
 }
@@ -3723,6 +3737,7 @@ pub fn cloud_endpoint_example(preset_id: &str) -> &'static str {
     match preset_id {
         "azure" => "https://NAME.openai.azure.com/openai/v1",
         "vertex" => "https://REGION-aiplatform.googleapis.com/v1/projects/PROJECT/locations/REGION",
+        "bedrock" => "https://bedrock-runtime.REGION.amazonaws.com",
         _ => "",
     }
 }
@@ -3746,16 +3761,17 @@ pub fn cloud_endpoint_ok(preset_id: &str, url: &str) -> Result<(), String> {
         Some(url::Host::Domain(h)) => h.to_ascii_lowercase(),
         _ => return Err(bad()),
     };
-    let under = suffixes.iter().any(|s| {
-        if !s.starts_with(['.', '-']) {
-            return host == *s;
-        }
-        host.strip_suffix(s).is_some_and(|label| {
-            !label.is_empty()
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+    let under = suffixes.iter().any(|s| match s.split_once('*') {
+        None => host == *s,
+        Some((pre, post)) => host
+            .strip_prefix(pre)
+            .and_then(|h| h.strip_suffix(post))
+            .is_some_and(|label| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }),
     });
     if u.scheme() != "https"
         || u.port().is_some_and(|p| p != 443)
