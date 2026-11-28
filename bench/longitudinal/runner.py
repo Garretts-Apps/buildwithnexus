@@ -174,6 +174,56 @@ def scan(tree: Path) -> dict:
     return out
 
 
+def python_public_names(text: str) -> set[str] | None:
+    import ast
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
+            names.add(node.name)
+    return names
+
+
+def api_diff(tree: Path, exclude: set[str]) -> dict:
+    """Public names the task added and removed: top-level functions and
+    classes of changed Python modules. Other languages aren't measured."""
+    added, removed, other = [], [], 0
+    for path in sh(["git", "diff", "--name-only", "HEAD~1", "HEAD"], tree).stdout.split():
+        if path in exclude:
+            continue
+        if not path.endswith(".py"):
+            other += 1
+            continue
+        before = python_public_names(sh(["git", "show", f"HEAD~1:{path}"], tree).stdout) or set()
+        after = python_public_names(sh(["git", "show", f"HEAD:{path}"], tree).stdout) or set()
+        added += [f"{path}:{n}" for n in sorted(after - before)]
+        removed += [f"{path}:{n}" for n in sorted(before - after)]
+    return {"api_added": added, "api_removed": removed, "api_unmeasured_files": other}
+
+
+def complexity(tree: Path, exclude: set[str]) -> dict | str:
+    """lizard's cyclomatic complexity of the changed files' functions: the
+    highest and the mean, or why there is none."""
+    if not shutil.which("lizard"):
+        return "not installed"
+    files = [f for f in sh(["git", "diff", "--name-only", "HEAD~1", "HEAD"], tree).stdout.split()
+             if f not in exclude and (tree / f).is_file()]
+    if not files:
+        return {"functions": 0}
+    out = sh(["lizard", "--csv", *files], tree).stdout
+    ccn = []
+    for row in out.splitlines():
+        parts = row.split(",")
+        if len(parts) > 1 and parts[1].isdigit():
+            ccn.append(int(parts[1]))
+    if not ccn:
+        return {"functions": 0}
+    return {"functions": len(ccn), "max_ccn": max(ccn), "mean_ccn": round(sum(ccn) / len(ccn), 2)}
+
+
 def run_tests(tree: Path, command: str, files: list[str], timeout: int) -> bool | None:
     if not files:
         return None
@@ -231,6 +281,8 @@ def run_sequence(manifest: dict, harness: dict, run_no: int, out: Path) -> list[
         commits = sh(["git", "log", "--format=%H", "-n", "4"], tree).stdout.split()
         reworked = rework(tree, commits[1:4] if n > 1 else [])
         findings = scan(tree)
+        api = api_diff(tree, set(hidden))
+        ccn = complexity(tree, set(hidden))
         bundle = out / f"{task['id']}.bundle"
         sh(["git", "bundle", "create", str(bundle), "HEAD"], tree)
         rec = {
@@ -247,6 +299,8 @@ def run_sequence(manifest: dict, harness: dict, run_no: int, out: Path) -> list[
             **size,
             "rework_lines": reworked,
             "scanner_findings": findings,
+            "complexity": ccn,
+            **api,
             **bwn_report(stdout),
         }
         (out / f"{task['id']}.json").write_text(json.dumps(rec, indent=2))

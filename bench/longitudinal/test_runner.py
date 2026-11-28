@@ -121,6 +121,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(oracle[0]["rework_lines"], 0)
         self.assertGreater(breaker[1]["rework_lines"], 0, breaker[1])
         self.assertIn("gitleaks", oracle[0]["scanner_findings"])
+        # The public API each change added or removed.
+        self.assertEqual(oracle[0]["api_added"], ["calc.py:mul"])
+        self.assertEqual(breaker[1]["api_removed"], ["calc.py:mul"])
+        self.assertIn("complexity", oracle[0])
         # Each task's tree is kept, and the manifest with its hash.
         self.assertTrue((root / "oracle" / "run1" / "t2.bundle").is_file())
         self.assertEqual(json.loads((root / "manifest.json").read_text())["base"], self.base)
