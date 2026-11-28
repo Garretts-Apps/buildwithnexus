@@ -3241,6 +3241,11 @@ fn build_turn(
                     timestamp: String::new(),
                 });
                 if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
+                    // A test that keeps failing becomes a proposed check
+                    // (roadmap 5.4).
+                    if out.is_error {
+                        crate::proposals::note_check_failure(cwd, &out.content);
+                    }
                     st.check_work_passed = Some(!out.is_error);
                     st.check_report = out.content.clone();
                     st.security_checked = !out.is_error

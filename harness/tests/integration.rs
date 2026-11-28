@@ -13533,8 +13533,16 @@ fn an_experiments_result_is_in_the_evidence_record() {
     let home = tmp("home");
     let cwd = tmp("proj");
     let g = |args: &[&str]| {
-        let o = Command::new("git").args(args).current_dir(&cwd).output().unwrap();
-        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     g(&["init", "-q", "-b", "main"]);
@@ -13545,10 +13553,22 @@ fn an_experiments_result_is_in_the_evidence_record() {
     g(&["commit", "-q", "-m", "base"]);
     // Two variants: one writes one file, the other two.
     let port = serve(vec![
-        tool_call("a", "write_file", json!({"path": "a.txt", "content": "a\n"})),
+        tool_call(
+            "a",
+            "write_file",
+            json!({"path": "a.txt", "content": "a\n"}),
+        ),
         finish("done"),
-        tool_call_raw_args("b1", "write_file", &json!({"path": "b1.txt", "content": "b\n"}).to_string()),
-        tool_call("b2", "write_file", json!({"path": "b2.txt", "content": "b\n"})),
+        tool_call_raw_args(
+            "b1",
+            "write_file",
+            &json!({"path": "b1.txt", "content": "b\n"}).to_string(),
+        ),
+        tool_call(
+            "b2",
+            "write_file",
+            json!({"path": "b2.txt", "content": "b\n"}),
+        ),
         finish("done"),
         finish("done"),
     ]);
@@ -13562,8 +13582,16 @@ fn an_experiments_result_is_in_the_evidence_record() {
     )
     .unwrap();
     let bwn = |args: &[&str]| {
-        let o = Command::new(BIN).args(args).current_dir(&cwd).env("NEXUS_HOME", &home).output().unwrap();
-        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned())
+        let o = Command::new(BIN)
+            .args(args)
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
     };
     let (code, said) = bwn(&["bg", "try", "2", "add a file"]);
     assert_eq!(code, Some(0), "{said}");
@@ -13581,5 +13609,8 @@ fn an_experiments_result_is_in_the_evidence_record() {
     assert!(body.contains("Bwn-Experiment: "), "{body}");
     let (code, verified) = bwn(&["evidence", "verify", "HEAD"]);
     assert_eq!(code, Some(0), "{verified}");
-    assert!(verified.contains("of experiment") && verified.contains("2 variants"), "{verified}");
+    assert!(
+        verified.contains("of experiment") && verified.contains("2 variants"),
+        "{verified}"
+    );
 }

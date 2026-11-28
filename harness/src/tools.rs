@@ -5000,6 +5000,15 @@ fn package_json_scripts(cwd: &Path) -> Vec<String> {
 // Auto-detect the project's build/test/lint commands from marker files. Returns
 // the first matching ecosystem's checks — projects aren't run through two
 // toolchains at once.
+/// The checks bwn detects in `cwd`, as `checks` entries (roadmap 5.4: a
+/// proposed check joins them, so naming one doesn't drop the others).
+pub fn detected_check_entries(cwd: &Path) -> Vec<Value> {
+    detect_checks(cwd)
+        .into_iter()
+        .map(|c| serde_json::json!({"name": c.label, "command": c.cmd, "kind": c.kind}))
+        .collect()
+}
+
 fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
     let has = |f: &str| cwd.join(f).exists();
     let owned = |s: &str| s.to_string();

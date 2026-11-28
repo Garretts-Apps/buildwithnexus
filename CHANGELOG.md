@@ -19,6 +19,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **A test that keeps failing becomes a proposed regression check (roadmap
+  5.4).** After the same cargo, pytest or Go test fails the project's
+  checks in three turns, `buildwithnexus rules accept check:<id>` adds a
+  check that runs it on every change. The check is added to the project's
+  `checks`, along with the detected checks.
 - **Experiments scored by verification (roadmap 5.8).**
   `buildwithnexus bg try <n> <task>` runs the task as n background agents
   in worktrees of their own. Each variant is scored by whether its commits

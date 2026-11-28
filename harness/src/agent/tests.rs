@@ -4748,3 +4748,72 @@ fn invariant_sd6_a_rule_enters_the_policy_only_through_a_human_answer() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+// Roadmap 5.4 (SD-6): a test that fails in the project's checks turn after
+// turn becomes a proposed regression check; it joins the project's
+// `checks` only on the person's answer, alongside the detected checks so
+// none drop out. A report's odd names can't become a command.
+#[test]
+fn invariant_sd6_a_recurring_failure_becomes_a_proposed_check_only_accepted_by_a_person() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("bwn-sd6c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    std::fs::create_dir_all(base.join("proj/src")).unwrap();
+    let home = base.canonicalize().unwrap().join("home");
+    let proj = base.canonicalize().unwrap().join("proj");
+    std::env::set_var("NEXUS_HOME", &home);
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        "[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let report = "check_work: FAILED\ntest parser::rejects_empty ... FAILED\ntest ok_one ... ok\nFAILED tests/test_api.py::test_login - assert 1 == 2\n--- FAIL: TestRoute (0.00s)\ntest x; touch pwned ... FAILED\n";
+    let found = crate::proposals::failing_tests(report);
+    assert_eq!(
+        found.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        [
+            "cargo:parser::rejects_empty",
+            "go:TestRoute",
+            "pytest:tests/test_api.py::test_login"
+        ]
+    );
+    assert!(found
+        .iter()
+        .any(|(_, c)| c == "cargo test -q parser::rejects_empty -- --exact"));
+
+    let settings = proj.join(".buildwithnexus/settings.json");
+    for _ in 0..crate::proposals::THRESHOLD - 1 {
+        crate::proposals::note_check_failure(&proj, report);
+    }
+    assert!(crate::proposals::proposed().is_empty());
+    crate::proposals::note_check_failure(&proj, report);
+    let key = "check:cargo:parser::rejects_empty";
+    assert!(crate::proposals::proposed().iter().any(|p| p == key));
+    assert!(!settings.exists(), "a proposal wrote the project's checks");
+
+    crate::proposals::accept(key).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let cmds: Vec<&str> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["command"].as_str())
+        .collect();
+    assert!(
+        cmds.contains(&"cargo test -q parser::rejects_empty -- --exact"),
+        "{v}"
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| c.starts_with("cargo test") && !c.contains("rejects_empty")),
+        "the detected checks were dropped: {v}"
+    );
+
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&base);
+}

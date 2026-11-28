@@ -864,5 +864,12 @@ reach. It changes nothing until you run
 `buildwithnexus rules accept <rule>`, which adds the rule to the deny list
 in your own settings. `buildwithnexus rules` lists the proposals, and
 `buildwithnexus rules dismiss <rule>` drops one. No tool the model has can
-accept a proposal. bwn doesn't yet propose regression tests from recurring
-check failures.
+accept a proposal.
+
+The same goes for a test that keeps failing. When the project's checks
+fail on the same cargo, pytest or Go test in three turns, bwn proposes a
+regression check that runs that one test on every change. Accepting it
+adds it to the project's `checks`, and with it the checks bwn detects, so
+none drop out. A project file that changed waits for trust again, as
+always. A test name with anything but letters, digits and `_:./-[]`
+isn't proposed, so a report can't turn into a command.
